@@ -18,6 +18,7 @@
 #include "../../utils/random.hpp"
 #include "../../utils/settings.hpp"
 #include "./shared.h"
+#include "./starlight.hpp"
 
 namespace {
 
@@ -82,7 +83,34 @@ thread_local uint64_t g_current_uav0 = 0;
       },                                                                                               \
   }
 
+// Star draws: no replacement, only observed to find which star casts each light
+#define StarlightObserveShader(value)                                                    \
+  {                                                                                      \
+      value,                                                                             \
+      {                                                                                  \
+          .crc32 = value,                                                                \
+          .on_draw = [](reshade::api::command_list* cmd_list) {                          \
+            return elitedangerous::starlight::OnStarDraw(cmd_list, value);               \
+          },                                                                             \
+      },                                                                                 \
+  }
+
+#define STARLIGHT_OBSERVERS                                                              \
+  StarlightObserveShader(0xB0ED86B7), /* StarOpaqueNoise (surface) */                    \
+      StarlightObserveShader(0x7AE10FE9), /* StarOpaqueNoise (surface) */                \
+      StarlightObserveShader(0xB7275333), /* SunHotspotQuad */                           \
+      StarlightObserveShader(0xDC21D860), /* SunBillboardGlow (corona) */                \
+      StarlightObserveShader(0xF1CBC91F), /* SunBillboardGlow (corona) */                \
+      StarlightObserveShader(0x509F27CB), /* SunLensFlareBillboard */                    \
+      StarlightObserveShader(0xA6457BFD), /* SunLensFlareBillboard */                    \
+      StarlightObserveShader(0x82FC416E) /* SunEdgeBillboards */
+
+// SDR output: only observe the star draws, leave the game's image pipeline alone
+renodx::mods::shader::CustomShaders starlight_only_shaders = {STARLIGHT_OBSERVERS};
+
 renodx::mods::shader::CustomShaders custom_shaders = {
+    STARLIGHT_OBSERVERS,
+
     // Upgrades
     UpgradeRTVReplaceShader(0xD7E646E3),  // tonemap
     UpgradeRTVReplaceShader(0x6BE69EF3),  // tonemap, no bloom
@@ -101,6 +129,10 @@ renodx::mods::shader::CustomShaders custom_shaders = {
     UpgradeUAVShader(0x5647AAC2),  // FSR1 Compute Shader
 
     __ALL_CUSTOM_SHADERS};
+
+// 0 = HDR (RenoDX swapchain + tone mapping), 1 = SDR (vanilla image, Starlight only)
+float output_sdr = 0.f;
+bool output_sdr_at_start = false;
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
@@ -392,6 +424,45 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::shader::expected_constant_buffer_index = 13;
         renodx::mods::shader::force_pipeline_cloning = true;
 
+        // Output + Starlight panels go just before the Links section
+        {
+          auto extra = elitedangerous::starlight::Settings();
+          extra.insert(extra.begin(), {
+                                          new renodx::utils::settings::Setting{
+                                              .key = "OutputMode",
+                                              .binding = &output_sdr,
+                                              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+                                              .default_value = 0.f,
+                                              .can_reset = false,
+                                              .label = "Output",
+                                              .section = "Output",
+                                              .tooltip = "SDR keeps the game's own SDR image (no HDR swapchain, no RenoDX\n"
+                                                         "tone mapping or upgrades) and only runs Starlight.\n"
+                                                         "Restart the game after changing.",
+                                              .labels = {"HDR (RenoDX)", "SDR (vanilla image + Starlight)"},
+                                              .is_global = true,
+                                          },
+                                          new renodx::utils::settings::Setting{
+                                              .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                                              .label = "Restart the game to apply the output change.",
+                                              .section = "Output",
+                                              .tint = 0xFF5A16,
+                                              .is_visible = []() { return (output_sdr != 0.f) != output_sdr_at_start; },
+                                          },
+                                      });
+          auto pos = std::find_if(settings.begin(), settings.end(), [](auto* s) { return s->section == "Links"; });
+          settings.insert(pos, extra.begin(), extra.end());
+        }
+
+        // Load settings now: the output mode decides what gets hooked
+        renodx::utils::settings::Use(DLL_PROCESS_ATTACH, &settings, &OnPresetOff);
+        output_sdr_at_start = output_sdr != 0.f;
+        if (output_sdr_at_start) {
+          reshade::log::message(reshade::log::level::info, "RenoDX Elite: SDR output, Starlight only");
+          initialized = true;  // skip the HDR swapchain setup below
+        }
+      }
+      if (!initialized) {
         // Swapchain Proxy
         renodx::mods::swapchain::SetUseHDR10();
         renodx::mods::swapchain::use_resource_cloning = true;
@@ -432,9 +503,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   }
 
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
-  renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
-  renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
+  if (output_sdr_at_start) {
+    renodx::mods::shader::Use(fdw_reason, starlight_only_shaders, &shader_injection);
+  } else {
+    renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
+    renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
+  }
   renodx::utils::random::Use(fdw_reason, {&shader_injection.custom_random});
+  elitedangerous::starlight::Use(fdw_reason);
 
   return TRUE;
 }
