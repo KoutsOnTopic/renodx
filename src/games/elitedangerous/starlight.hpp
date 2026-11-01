@@ -136,6 +136,12 @@ struct StarShader {
   uint32_t colour_offset;  // byte offset of the star colour inside b2
 };
 // CRC32 of the pixel shader bytecode (same hash RenoDX uses).
+// The surface shader (StarOpaqueNoise) never reads gStarColour/gStarArtistColour:
+// its output is pDiffuseTexture * gStarBaseColourWeight * gStarOverallBrightness
+// (+ gStarBurnTexture in variant _1); hotspot = texture * gStarArtistColour,
+// corona = gCoronaArtistColour. The constant below is therefore only the
+// class signature and the fallback colour; the seen colour is measured from
+// the rendered frame (StarProbe).
 inline const std::unordered_map<uint32_t, StarShader> kStarShaders = {
     {0xB0ED86B7, {StarFx::Surface, 16}},  // ps_StarOpaqueNoise_Forward0_0_0_0  gStarArtistColour
     {0x7AE10FE9, {StarFx::Surface, 16}},  // ps_StarOpaqueNoise_Forward0_0_0_1
@@ -208,6 +214,8 @@ struct BufferShadow {
 struct Bindings {
   // [0] vertex, [1] pixel; slots b0..b2
   std::array<std::array<reshade::api::buffer_range, 3>, 2> cb{};
+  std::array<reshade::api::resource_view, 8> ps_srv{};  // pixel-stage t0..t7 (diagnostics)
+  reshade::api::resource rt0{};                         // resource behind render target 0
 };
 
 // ---- per-light identity ----------------------------------------------------
@@ -224,16 +232,70 @@ struct LightState {
   float match_cos = 0.f;
   uint32_t frames_since_match = 0;
   uint32_t frames_inactive = 0;
+  // measured from the rendered star (see StarProbe); reset with the identity
+  bool measured_valid = false;
+  Rgb measured_acc;
+  uint32_t measured_samples = 0;
 };
 
 struct FrameMatch {
   bool any = false;
   StarFx fx = StarFx::Count;
-  Rgb colour;
+  Rgb colour;      // what the star looks like (texture average when available)
+  Rgb sig_colour;  // the b2 constant, stable per class: used for the signature
   float cos = -2.f;
 };
 
+// ---- rendered star colour ---------------------------------------------------
+// What the star looks like cannot be read from its constants: the surface
+// shader colours by texture, and hotspot/corona/edge layers (own constants)
+// are drawn on top (a Y dwarf: orange texture + blue/purple layers = magenta).
+// So the colour is measured: a small window of the scene render target around
+// the star's projected centre is copied out and averaged (see
+// RunStarReadback). The measurement is kept per light while its identity
+// holds.
+struct StarProbe {
+  bool want = false;
+  reshade::api::resource target{};  // render target the star surface was drawn into
+  float ndc[2] = {0, 0};            // star centre in normalised device coordinates
+  uint64_t frame = 0;
+  uint64_t last_sampled = 0;
+};
+inline std::array<StarProbe, 2> probe;
+struct Readback {
+  reshade::api::resource staging{};
+  reshade::api::format format{};
+  uint64_t frame = 0;
+  int light = 0;
+  bool warned_msaa = false, warned_format = false;
+};
+inline Readback readback;
+inline uint32_t stat_readbacks = 0;
+constexpr int kProbeBox = 16;            // pixels, square window at the star centre
+constexpr uint64_t kProbePeriod = 10;    // frames between samples of the same light
+constexpr uint64_t kReadbackDelay = 3;   // frames before mapping the copy
+constexpr float kMeasureDecay = 0.8f;    // accumulation memory per sample
+
 inline std::mutex state_mutex;
+// ReShade raises destroy_resource from inside D3D calls (the runtime fires
+// its destruction notifier when it finally frees a game resource, e.g. during
+// a copy or a map). If that happens on a thread that already holds
+// state_mutex, locking again would abort the process, so (a) nothing calls
+// into D3D while holding the lock, and (b) every event callback bails out
+// when this thread already holds it.
+inline thread_local bool in_state_lock = false;
+struct StateLock {
+  StateLock() {
+    state_mutex.lock();
+    in_state_lock = true;
+  }
+  ~StateLock() {
+    in_state_lock = false;
+    state_mutex.unlock();
+  }
+  StateLock(const StateLock&) = delete;
+  StateLock& operator=(const StateLock&) = delete;
+};
 inline std::unordered_map<uint64_t, BufferShadow> shadows;
 inline std::unordered_map<uint64_t, Bindings> bindings;  // per command list
 inline std::array<LightState, 2> lights;
@@ -287,6 +349,8 @@ inline std::set<std::tuple<uint64_t, uint32_t, char, int, uint64_t>> scan_seen;
 inline std::set<uint64_t> scan_hit_handles;
 constexpr uint32_t kScanLogCap = 150;
 inline std::array<uint32_t, static_cast<size_t>(StarFx::Count)> stat_fx_draws{};
+inline std::set<std::string> star_dumps_seen;  // probe log: each distinct star constant block once
+constexpr size_t kStarDumpCap = 64;
 inline float stat_best_cos[2] = {-2.f, -2.f};
 inline uint64_t frame_index = 0;
 inline thread_local bool in_own_update = false;
@@ -325,7 +389,7 @@ inline void LoadTables() {
     if ((s >> c.r >> c.g >> c.b) && c.r >= 0 && c.g >= 0 && c.b >= 0) table[k] = c;
   });
   parse(signatures_path, [&](const std::string& k, const std::string& v) { sigs[k] = v; });
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   colour_table = std::move(table);
   learned = std::move(sigs);
 }
@@ -356,7 +420,7 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   if (l.known) {
     if (config.mode == 3.f) target = LookupClassColour(l.cls);
     if (target == nullptr && config.mode >= 2.f) {
-      star = l.star_colour;
+      star = l.measured_valid ? l.measured_acc : l.star_colour;  // measured when the star has been seen
       target = &star;
     }
   }
@@ -554,6 +618,178 @@ inline bool OnBufferData(BufferShadow& sh, uint8_t* base) {
   return false;
 }
 
+// ---- pixel decoding (for the star readback) ---------------------------------
+inline float HalfToFloat(uint16_t h) {
+  const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+  float v;
+  if (e == 0) v = std::ldexp(static_cast<float>(m), -24);
+  else if (e == 31) v = m == 0 ? INFINITY : NAN;
+  else v = std::ldexp(1.f + static_cast<float>(m) / 1024.f, static_cast<int>(e) - 15);
+  return s != 0u ? -v : v;
+}
+// R11G11B10_FLOAT: 5-bit exponents, 6/6/5-bit mantissas, no sign.
+inline float SmallFloat(uint32_t bits, int mantissa_bits) {
+  const uint32_t e = (bits >> mantissa_bits) & 0x1Fu, m = bits & ((1u << mantissa_bits) - 1u);
+  const float mf = static_cast<float>(m) / static_cast<float>(1u << mantissa_bits);
+  if (e == 0) return std::ldexp(mf, -14);
+  if (e == 31) return m == 0 ? INFINITY : NAN;
+  return std::ldexp(1.f + mf, static_cast<int>(e) - 15);
+}
+
+// Average (linear) colour of a mapped subresource, or nullopt for formats we
+// do not decode. Only HDR scene formats and 8-bit RGBA are needed.
+inline std::optional<Rgb> AverageTexels(reshade::api::format fmt, uint32_t w, uint32_t h, const uint8_t* data,
+                                        uint32_t row_pitch) {
+  using reshade::api::format;
+  double sum[3] = {0, 0, 0};
+  uint64_t n = 0;
+  auto add = [&](const float* c) {
+    if (!Finite(c, 3)) return;
+    for (int k = 0; k < 3; ++k) sum[k] += c[k];
+    ++n;
+  };
+  for (uint32_t y = 0; y < h; ++y) {
+    const uint8_t* row = data + y * row_pitch;
+    for (uint32_t x = 0; x < w; ++x) {
+      float c[3];
+      switch (fmt) {
+        case format::r16g16b16a16_typeless:
+        case format::r16g16b16a16_float: {
+          uint16_t hv[3];
+          std::memcpy(hv, row + x * 8, sizeof(hv));
+          c[0] = HalfToFloat(hv[0]), c[1] = HalfToFloat(hv[1]), c[2] = HalfToFloat(hv[2]);
+          break;
+        }
+        case format::r32g32b32a32_typeless:
+        case format::r32g32b32a32_float:
+          std::memcpy(c, row + x * 16, sizeof(c));
+          break;
+        case format::r11g11b10_float: {
+          uint32_t v;
+          std::memcpy(&v, row + x * 4, sizeof(v));
+          c[0] = SmallFloat(v, 6), c[1] = SmallFloat(v >> 11, 6), c[2] = SmallFloat(v >> 22, 5);
+          break;
+        }
+        case format::r8g8b8a8_typeless:
+        case format::r8g8b8a8_unorm:
+        case format::r8g8b8a8_unorm_srgb:
+        case format::b8g8r8a8_typeless:
+        case format::b8g8r8a8_unorm:
+        case format::b8g8r8a8_unorm_srgb: {
+          const bool bgr = fmt == format::b8g8r8a8_typeless || fmt == format::b8g8r8a8_unorm
+                           || fmt == format::b8g8r8a8_unorm_srgb;
+          const uint8_t* p = row + x * 4;
+          c[0] = p[bgr ? 2 : 0] / 255.f, c[1] = p[1] / 255.f, c[2] = p[bgr ? 0 : 2] / 255.f;
+          break;
+        }
+        default:
+          return std::nullopt;
+      }
+      add(c);
+    }
+  }
+  if (n == 0) return std::nullopt;
+  return Rgb{static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n), static_cast<float>(sum[2] / n)};
+}
+
+// ---- rendered star readback -------------------------------------------------
+// Called at present, before EndFrame, WITHOUT state_mutex held: every D3D
+// call here can make the runtime destroy game resources, which fires
+// ReShade's destroy_resource event on this same thread (see StateLock).
+// One copy in flight at a time.
+inline void RunStarReadback(reshade::api::command_queue* queue) {
+  auto* device = queue->get_device();
+
+  // 1. a finished copy: map, average, fold into the light's measured colour
+  Readback rb;
+  {
+    StateLock lock;
+    rb = readback;
+  }
+  if (rb.staging.handle != 0u && frame_index - rb.frame >= kReadbackDelay) {
+    reshade::api::subresource_data mapped{};
+    std::optional<Rgb> avg;
+    if (device->map_texture_region(rb.staging, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
+      avg = AverageTexels(rb.format, kProbeBox, kProbeBox, static_cast<const uint8_t*>(mapped.data), mapped.row_pitch);
+      device->unmap_texture_region(rb.staging, 0);
+    }
+    device->destroy_resource(rb.staging);
+    StateLock lock;
+    readback.staging = {};
+    ++stat_readbacks;
+    if (!avg.has_value()) {
+      if (!readback.warned_format) {
+        readback.warned_format = true;
+        std::stringstream s;
+        s << "starlight readback: scene format " << static_cast<uint32_t>(rb.format) << " not decoded";
+        reshade::log::message(reshade::log::level::info, s.str().c_str());
+      }
+    } else if (Luma(*avg) > 0.f) {
+      // Bright samples dominate (accumulated in linear light), so a dark frame
+      // where a strut covered the star barely counts.
+      LightState& l = lights[rb.light];
+      const float keep = l.measured_valid ? kMeasureDecay : 0.f;
+      l.measured_acc = {l.measured_acc.r * keep + avg->r, l.measured_acc.g * keep + avg->g, l.measured_acc.b * keep + avg->b};
+      l.measured_valid = true;
+      ++l.measured_samples;
+      if (config.probe_log != 0.f && l.measured_samples <= 5) {
+        std::stringstream s;
+        s << "starlight readback: light " << rb.light + 1 << " sample (" << avg->r << "," << avg->g << "," << avg->b
+          << ") fmt" << static_cast<uint32_t>(rb.format);
+        reshade::log::message(reshade::log::level::info, s.str().c_str());
+      }
+    }
+    rb.staging = {};
+  }
+  if (rb.staging.handle != 0u) return;  // still waiting for the GPU
+
+  // 2. a star seen this frame: copy a window around it out of the scene target
+  StarProbe p;
+  int light = -1;
+  {
+    StateLock lock;
+    for (int i = 0; i < 2 && light < 0; ++i) {
+      if (!probe[i].want || probe[i].frame != frame_index) continue;
+      probe[i].want = false;
+      if (frame_index - probe[i].last_sampled < kProbePeriod) continue;
+      p = probe[i];
+      light = i;
+    }
+  }
+  if (light < 0) return;
+  const auto desc = device->get_resource_desc(p.target);
+  if (desc.type != reshade::api::resource_type::texture_2d) return;
+  if (desc.texture.samples > 1) {
+    StateLock lock;
+    if (!readback.warned_msaa) {
+      readback.warned_msaa = true;
+      reshade::log::message(reshade::log::level::info, "starlight readback: scene target is multisampled, not supported");
+    }
+    return;
+  }
+  const float fx = (p.ndc[0] * 0.5f + 0.5f) * static_cast<float>(desc.texture.width);
+  const float fy = (0.5f - p.ndc[1] * 0.5f) * static_cast<float>(desc.texture.height);
+  const int half = kProbeBox / 2;
+  const int left = static_cast<int>(fx) - half, top = static_cast<int>(fy) - half;
+  if (left < 0 || top < 0 || left + kProbeBox > static_cast<int>(desc.texture.width)
+      || top + kProbeBox > static_cast<int>(desc.texture.height))
+    return;
+  const reshade::api::resource_desc staging_desc(kProbeBox, kProbeBox, 1, 1, desc.texture.format, 1,
+                                                 reshade::api::memory_heap::gpu_to_cpu,
+                                                 reshade::api::resource_usage::copy_dest);
+  reshade::api::resource staging{};
+  if (!device->create_resource(staging_desc, nullptr, reshade::api::resource_usage::copy_dest, &staging)) return;
+  reshade::api::subresource_box box{static_cast<uint32_t>(left), static_cast<uint32_t>(top), 0,
+                                    static_cast<uint32_t>(left + kProbeBox), static_cast<uint32_t>(top + kProbeBox), 1};
+  queue->get_immediate_command_list()->copy_texture_region(p.target, 0, &box, staging, 0, nullptr);
+  StateLock lock;
+  readback.staging = staging;
+  readback.format = desc.texture.format;
+  readback.frame = frame_index;
+  readback.light = light;
+  probe[light].last_sampled = frame_index;
+}
+
 // ---- star draw -------------------------------------------------------------
 inline const BufferShadow* Bound(const Bindings& b, int stage, int slot, uint64_t& offset) {
   const auto& range = b.cb[stage][slot];
@@ -565,11 +801,12 @@ inline const BufferShadow* Bound(const Bindings& b, int stage, int slot, uint64_
 }
 
 inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
+  if (in_state_lock) return true;
   auto si = kStarShaders.find(crc);
   if (si == kStarShaders.end()) return true;
   const StarShader& star = si->second;
 
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   ++stat_star_draws;
   ++stat_fx_draws[static_cast<size_t>(star.fx)];
 
@@ -593,6 +830,40 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
   float colour[3];
   std::memcpy(colour, b2->bytes.data() + star.colour_offset, sizeof(colour));
   if (!Finite(&m[0][0], 16) || !Finite(colour, 3)) return true;
+
+  const Rgb seen{colour[0], colour[1], colour[2]};  // fallback until the star has been measured
+  const Rgb sig{colour[0], colour[1], colour[2]};
+
+  // Probe log: dump each distinct star's constants (c0..c3) and its textures once.
+  if (config.probe_log != 0.f && star_dumps_seen.size() < kStarDumpCap) {
+    const size_t n = std::min<size_t>(b2->bytes.size(), 64);
+    char kb[96];
+    std::snprintf(kb, sizeof(kb), "%s:%.3f,%.3f,%.3f", FxName(star.fx), sig.r, sig.g, sig.b);  // ignore jitter
+    if (star_dumps_seen.insert(kb).second) {
+      std::stringstream s;
+      s << "starlight star: " << FxName(star.fx) << " b2";
+      for (size_t k = 0; k + 4 <= n; k += 4) {
+        float f;
+        std::memcpy(&f, b2->bytes.data() + k, 4);
+        s << (k % 16 == 0 ? " c" + std::to_string(k / 16) + "=(" : ",") << f << (k % 16 == 12 ? ")" : "");
+      }
+      const GvdFields& gg = b1->gvd;
+      s << " light0=(" << gg.colour[0][0] << "," << gg.colour[0][1] << "," << gg.colour[0][2] << ")"
+        << " seen=(" << seen.r << "," << seen.g << "," << seen.b << ")";
+      auto* device = cmd_list->get_device();
+      for (size_t t = 0; t < bit->second.ps_srv.size(); ++t) {
+        const auto view = bit->second.ps_srv[t];
+        if (view.handle == 0u) continue;
+        const auto res = device->get_resource_from_view(view);
+        if (res.handle == 0u) continue;
+        const auto d = device->get_resource_desc(res);
+        if (d.type != reshade::api::resource_type::texture_2d) continue;
+        s << " t" << t << "=" << std::hex << res.handle << std::dec << ":fmt" << static_cast<uint32_t>(d.texture.format)
+          << ":" << d.texture.width << "x" << d.texture.height << ":mips" << d.texture.levels;
+      }
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
+  }
 
   // star centre candidates: gStellarBodyPosition, and the object origin
   const GvdFields& g = b1->gvd;
@@ -618,7 +889,14 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
         if (c < threshold) continue;
         FrameMatch& fm = frame_match[i];
         const bool better = !fm.any || FxRank(star.fx) < FxRank(fm.fx) || (FxRank(star.fx) == FxRank(fm.fx) && c > fm.cos);
-        if (better) fm = {true, star.fx, {colour[0], colour[1], colour[2]}, c};
+        if (better) fm = {true, star.fx, seen, sig, c};
+        // The surface draw tells where the star is on screen and which target
+        // it is drawn into: sample the rendered colour there at present.
+        if (star.fx == StarFx::Surface && sc[3] > 0.f && bit->second.rt0.handle != 0u) {
+          const float nx = sc[0] / sc[3], ny = sc[1] / sc[3];
+          if (std::abs(nx) < 0.95f && std::abs(ny) < 0.95f)
+            probe[i] = {true, bit->second.rt0, {nx, ny}, frame_index, probe[i].last_sampled};
+        }
       }
     }
   }
@@ -627,7 +905,7 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
 
 // ---- per frame -------------------------------------------------------------
 inline void EndFrame() {
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   ++frame_index;
   bool learned_changed = false;
 
@@ -649,14 +927,23 @@ inline void EndFrame() {
     }
     l.active = active;
 
+    if (!l.known) {
+      l.measured_valid = false;  // a new star: measure afresh
+      l.measured_samples = 0;
+    }
     const FrameMatch& fm = frame_match[i];
     if (fm.any) {
+      const std::string sig = SignatureKey(fm.fx, fm.sig_colour);
+      if (l.known && sig != l.signature) {
+        l.measured_valid = false;
+        l.measured_samples = 0;
+      }
       l.known = true;
       l.source = fm.fx;
       l.star_colour = fm.colour;
       l.match_cos = fm.cos;
       l.frames_since_match = 0;
-      l.signature = SignatureKey(fm.fx, fm.colour);
+      l.signature = sig;
       auto it = learned.find(l.signature);
       l.cls = it != learned.end() ? it->second : std::string{};
     } else {
@@ -770,7 +1057,7 @@ inline void JournalLoop() {
             && line.find("\"JumpType\":\"Hyperspace\"") != std::string::npos) {
           pending = JsonField(line, "StarClass");
         } else if (line.find("\"event\":\"FSDJump\"") != std::string::npos && !pending.empty()) {
-          std::scoped_lock lock(state_mutex);
+          StateLock lock;
           arrival_class = pending;
           ++arrival_seq;
           arrival_frame = 0;
@@ -791,18 +1078,19 @@ inline void JournalLoop() {
 inline void OnInitResource(reshade::api::device*, const reshade::api::resource_desc& desc,
                            const reshade::api::subresource_data* initial, reshade::api::resource_usage,
                            reshade::api::resource resource) {
+  if (in_state_lock) return;
   if (desc.type != reshade::api::resource_type::buffer) return;
   const uint64_t size = desc.buffer.size;
   const auto usage = static_cast<uint32_t>(desc.usage);
   const bool is_cb = (usage & static_cast<uint32_t>(reshade::api::resource_usage::constant_buffer)) != 0u;
   const bool is_gvd = is_cb && size >= gvd::kSize && size <= gvd::kMaxSize;
   if (!is_gvd) {
-    std::scoped_lock lock(state_mutex);
+    StateLock lock;
     any_buffers[resource.handle] = {size, usage, nullptr};
   }
   if (!is_cb) return;
   if (!is_gvd && size > kSmallBufferMax) return;
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   auto& sh = shadows[resource.handle];
   sh = {};
   sh.size = size;
@@ -814,16 +1102,32 @@ inline void OnInitResource(reshade::api::device*, const reshade::api::resource_d
   }
 }
 
-inline void OnDestroyResource(reshade::api::device*, reshade::api::resource resource) {
-  std::scoped_lock lock(state_mutex);
+inline void OnDestroyResource(reshade::api::device* device, reshade::api::resource resource) {
+  if (in_state_lock) return;
+  StateLock lock;
   shadows.erase(resource.handle);
   any_buffers.erase(resource.handle);
+  for (auto& p : probe)
+    if (p.target.handle == resource.handle) p = {};
+  for (auto& [cl, b] : bindings)
+    if (b.rt0.handle == resource.handle) b.rt0 = {};
+  (void)device;
+}
+
+inline void OnBindRenderTargets(reshade::api::command_list* cmd_list, uint32_t count,
+                                const reshade::api::resource_view* rtvs, reshade::api::resource_view) {
+  if (in_state_lock) return;
+  reshade::api::resource rt{};
+  if (count > 0 && rtvs != nullptr && rtvs[0].handle != 0u) rt = cmd_list->get_device()->get_resource_from_view(rtvs[0]);
+  StateLock lock;
+  bindings[reinterpret_cast<uint64_t>(cmd_list)].rt0 = rt;
 }
 
 inline void OnMapBufferRegion(reshade::api::device*, reshade::api::resource resource, uint64_t offset, uint64_t,
                               reshade::api::map_access access, void** data) {
+  if (in_state_lock) return;
   if (data == nullptr || *data == nullptr || offset != 0 || access == reshade::api::map_access::read_only) return;
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   auto it = shadows.find(resource.handle);
   if (it != shadows.end()) it->second.mapped = static_cast<uint8_t*>(*data);
   auto ab = any_buffers.find(resource.handle);
@@ -833,7 +1137,8 @@ inline void OnMapBufferRegion(reshade::api::device*, reshade::api::resource reso
 }
 
 inline void OnUnmapBufferRegion(reshade::api::device*, reshade::api::resource resource) {
-  std::scoped_lock lock(state_mutex);
+  if (in_state_lock) return;
+  StateLock lock;
   auto it = shadows.find(resource.handle);
   if (it != shadows.end() && it->second.mapped != nullptr) {
     OnBufferData(it->second, it->second.mapped);
@@ -848,11 +1153,12 @@ inline void OnUnmapBufferRegion(reshade::api::device*, reshade::api::resource re
 
 inline bool OnUpdateBufferRegion(reshade::api::device* device, const void* data, reshade::api::resource dest,
                                  uint64_t dest_offset, uint64_t size) {
+  if (in_state_lock) return false;
   if (in_own_update || data == nullptr) return false;
   std::vector<uint8_t> copy;
   bool changed = false;
   {
-    std::scoped_lock lock(state_mutex);
+    StateLock lock;
     auto it = shadows.find(dest.handle);
     if (it != shadows.end() && dest_offset == 0) {
       const uint64_t n = size == UINT64_MAX ? it->second.size : size;
@@ -881,7 +1187,8 @@ inline bool OnUpdateBufferRegion(reshade::api::device* device, const void* data,
 // Diagnostic: show where buffers holding light records are copied to.
 inline bool OnCopyBufferRegion(reshade::api::command_list*, reshade::api::resource src, uint64_t src_offset,
                                reshade::api::resource dst, uint64_t dst_offset, uint64_t size) {
-  std::scoped_lock lock(state_mutex);
+  if (in_state_lock) return false;
+  StateLock lock;
   if (scan_frames_left <= 0 || !scan_hit_handles.contains(src.handle) || scan_hits_logged >= kScanLogCap) return false;
   ++scan_hits_logged;
   auto d = any_buffers.find(dst.handle);
@@ -895,11 +1202,12 @@ inline bool OnCopyBufferRegion(reshade::api::command_list*, reshade::api::resour
 }
 
 inline bool OnCopyResource(reshade::api::command_list* cmd_list, reshade::api::resource src, reshade::api::resource dst) {
+  if (in_state_lock) return false;
   return OnCopyBufferRegion(cmd_list, src, 0, dst, 0, UINT64_MAX);
 }
 
 inline void StartScan() {
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   scan_frames_left = 180;
   scan_hits_logged = 0;
   scan_buffers = 0;
@@ -918,13 +1226,26 @@ inline void StartScan() {
 inline void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api::shader_stage stages,
                               reshade::api::pipeline_layout, uint32_t,
                               const reshade::api::descriptor_table_update& update) {
-  if (update.type != reshade::api::descriptor_type::constant_buffer || update.descriptors == nullptr) return;
+  if (in_state_lock) return;
+  if (update.descriptors == nullptr) return;
   int stage = -1;
   if (stages == reshade::api::shader_stage::vertex) stage = 0;
   if (stages == reshade::api::shader_stage::pixel) stage = 1;
   if (stage < 0) return;
+  if (update.type == reshade::api::descriptor_type::shader_resource_view) {
+    if (stage != 1) return;
+    const auto* views = static_cast<const reshade::api::resource_view*>(update.descriptors);
+    StateLock lock;
+    auto& b = bindings[reinterpret_cast<uint64_t>(cmd_list)];
+    for (uint32_t i = 0; i < update.count; ++i) {
+      const uint32_t slot = update.binding + i;
+      if (slot < b.ps_srv.size()) b.ps_srv[slot] = views[i];
+    }
+    return;
+  }
+  if (update.type != reshade::api::descriptor_type::constant_buffer) return;
   const auto* ranges = static_cast<const reshade::api::buffer_range*>(update.descriptors);
-  std::scoped_lock lock(state_mutex);
+  StateLock lock;
   auto& b = bindings[reinterpret_cast<uint64_t>(cmd_list)];
   for (uint32_t i = 0; i < update.count; ++i) {
     const uint32_t slot = update.binding + i;
@@ -932,8 +1253,9 @@ inline void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api
   }
 }
 
-inline void OnPresent(reshade::api::command_queue*, reshade::api::swapchain*, const reshade::api::rect*,
+inline void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain*, const reshade::api::rect*,
                       const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  if (queue != nullptr) RunStarReadback(queue);
   EndFrame();
 }
 
@@ -1015,7 +1337,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .value_type = SettingValueType::CUSTOM,
           .section = "Starlight",
           .on_draw = [] {
-            std::scoped_lock lock(state_mutex);
+            StateLock lock;
             ImGui::Text("GlobalViewData uploads %u (rejected %u, size %llu)   star draws %u (unbound %u)",
                         stat_gvd_uploads, stat_gvd_rejected, static_cast<unsigned long long>(stat_gvd_size_seen),
                         stat_star_draws, stat_star_unbound);
@@ -1031,6 +1353,13 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                             FxName(l.source), l.star_colour.r, l.star_colour.g, l.star_colour.b, l.match_cos,
                             "", l.frames_since_match);
                 ImGui::Text("   %s  class: %s", l.signature.c_str(), l.cls.empty() ? "unlearned" : l.cls.c_str());
+                if (l.measured_valid) {
+                  const float s = l.measured_acc.r + l.measured_acc.g + l.measured_acc.b;
+                  ImGui::Text("   seen on screen: chroma %.3f %.3f %.3f  (%u samples)", l.measured_acc.r / s,
+                              l.measured_acc.g / s, l.measured_acc.b / s, l.measured_samples);
+                } else {
+                  ImGui::TextUnformatted("   seen on screen: not measured yet (using the star's constant)");
+                }
               } else {
                 ImGui::TextUnformatted("   star not identified yet (look towards it)");
               }
@@ -1053,7 +1382,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                         hot_kinds.size(), stat_list_patched, scan_frames_left > 0 ? "  [scanning]" : "");
             ImGui::Text("GlobalViewData per frame: %u uploads, colour variants %u / %u",
                         stat_gvd_per_frame, stat_variants[0], stat_variants[1]);
-            ImGui::Text("Learned signatures: %zu", learned.size());
+            ImGui::Text("Learned signatures: %zu   star readbacks: %u", learned.size(), stat_readbacks);
             return false;
           },
       },
@@ -1075,6 +1404,7 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::register_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
       reshade::register_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
@@ -1089,6 +1419,7 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(OnUnmapBufferRegion);
       reshade::unregister_event<reshade::addon_event::update_buffer_region>(OnUpdateBufferRegion);
       reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(OnBindRenderTargets);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_event<reshade::addon_event::copy_buffer_region>(OnCopyBufferRegion);
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
