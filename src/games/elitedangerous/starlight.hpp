@@ -236,6 +236,7 @@ struct LightState {
   bool measured_valid = false;
   Rgb measured_acc;
   uint32_t measured_samples = 0;
+  float measured_peak = 0.f;  // brightest sample so far; much dimmer ones are not the star
 };
 
 struct FrameMatch {
@@ -259,22 +260,36 @@ struct StarProbe {
   reshade::api::resource target{};  // render target the star surface was drawn into
   float ndc[2] = {0, 0};            // star centre in normalised device coordinates
   uint64_t frame = 0;
+  uint64_t cmd_list = 0;            // command list of that draw
   uint64_t last_sampled = 0;
 };
 inline std::array<StarProbe, 2> probe;
 struct Readback {
-  reshade::api::resource staging{};
+  reshade::api::resource staging{};  // persistent kProbeBox^2 staging texture
   reshade::api::format format{};
+  bool pending = false;              // a copy has been recorded and not read yet
   uint64_t frame = 0;
   int light = 0;
+  // diagnostics of the pending copy
+  uint64_t target = 0;
+  uint32_t width = 0, height = 0;
+  int px = 0, py = 0;
   bool warned_msaa = false, warned_format = false;
 };
 inline Readback readback;
-inline uint32_t stat_readbacks = 0;
+inline uint32_t stat_readbacks = 0, stat_probes_skipped = 0;
+// The star surface is also drawn in side passes (a 256x256 reflection probe
+// face per frame), which keep matching while the main view looks away. Only
+// the main view is sampled: a target at least half the back buffer's width
+// (the scene may render below output resolution with upscaling).
+inline uint32_t backbuffer_width = 0, backbuffer_height = 0;
 constexpr int kProbeBox = 16;            // pixels, square window at the star centre
 constexpr uint64_t kProbePeriod = 10;    // frames between samples of the same light
 constexpr uint64_t kReadbackDelay = 3;   // frames before mapping the copy
 constexpr float kMeasureDecay = 0.8f;    // accumulation memory per sample
+constexpr float kMinSampleFraction = 0.02f;  // of the brightest sample; dimmer ones are ignored
+constexpr uint32_t kReadbackLogCap = 300;     // probe log: samples logged per session
+constexpr float kMinPeakPixelLuma = 1.0f;     // HDR scene units; the star core exceeds this
 
 inline std::mutex state_mutex;
 // ReShade raises destroy_resource from inside D3D calls (the runtime fires
@@ -639,13 +654,15 @@ inline float SmallFloat(uint32_t bits, int mantissa_bits) {
 // Average (linear) colour of a mapped subresource, or nullopt for formats we
 // do not decode. Only HDR scene formats and 8-bit RGBA are needed.
 inline std::optional<Rgb> AverageTexels(reshade::api::format fmt, uint32_t w, uint32_t h, const uint8_t* data,
-                                        uint32_t row_pitch) {
+                                        uint32_t row_pitch, float* max_luma = nullptr) {
   using reshade::api::format;
   double sum[3] = {0, 0, 0};
   uint64_t n = 0;
+  float peak = 0.f;
   auto add = [&](const float* c) {
     if (!Finite(c, 3)) return;
     for (int k = 0; k < 3; ++k) sum[k] += c[k];
+    peak = std::max(peak, Luma({c[0], c[1], c[2]}));
     ++n;
   };
   for (uint32_t y = 0; y < h; ++y) {
@@ -689,76 +706,29 @@ inline std::optional<Rgb> AverageTexels(reshade::api::format fmt, uint32_t w, ui
     }
   }
   if (n == 0) return std::nullopt;
+  if (max_luma != nullptr) *max_luma = peak;
   return Rgb{static_cast<float>(sum[0] / n), static_cast<float>(sum[1] / n), static_cast<float>(sum[2] / n)};
 }
 
 // ---- rendered star readback -------------------------------------------------
-// Called at present, before EndFrame, WITHOUT state_mutex held: every D3D
-// call here can make the runtime destroy game resources, which fires
-// ReShade's destroy_resource event on this same thread (see StateLock).
-// One copy in flight at a time.
-inline void RunStarReadback(reshade::api::command_queue* queue) {
-  auto* device = queue->get_device();
+// Two halves, both WITHOUT state_mutex held around D3D calls (see StateLock):
+// CopyStarWindow runs when the render target the star was drawn into gets
+// unbound (the star pass is over, nothing has reused the target yet) and
+// records the copy on that command list; RunStarReadback at present maps the
+// finished copy. One copy in flight at a time; the staging texture persists.
 
-  // 1. a finished copy: map, average, fold into the light's measured colour
-  Readback rb;
-  {
-    StateLock lock;
-    rb = readback;
-  }
-  if (rb.staging.handle != 0u && frame_index - rb.frame >= kReadbackDelay) {
-    reshade::api::subresource_data mapped{};
-    std::optional<Rgb> avg;
-    if (device->map_texture_region(rb.staging, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
-      avg = AverageTexels(rb.format, kProbeBox, kProbeBox, static_cast<const uint8_t*>(mapped.data), mapped.row_pitch);
-      device->unmap_texture_region(rb.staging, 0);
-    }
-    device->destroy_resource(rb.staging);
-    StateLock lock;
-    readback.staging = {};
-    ++stat_readbacks;
-    if (!avg.has_value()) {
-      if (!readback.warned_format) {
-        readback.warned_format = true;
-        std::stringstream s;
-        s << "starlight readback: scene format " << static_cast<uint32_t>(rb.format) << " not decoded";
-        reshade::log::message(reshade::log::level::info, s.str().c_str());
-      }
-    } else if (Luma(*avg) > 0.f) {
-      // Bright samples dominate (accumulated in linear light), so a dark frame
-      // where a strut covered the star barely counts.
-      LightState& l = lights[rb.light];
-      const float keep = l.measured_valid ? kMeasureDecay : 0.f;
-      l.measured_acc = {l.measured_acc.r * keep + avg->r, l.measured_acc.g * keep + avg->g, l.measured_acc.b * keep + avg->b};
-      l.measured_valid = true;
-      ++l.measured_samples;
-      if (config.probe_log != 0.f && l.measured_samples <= 5) {
-        std::stringstream s;
-        s << "starlight readback: light " << rb.light + 1 << " sample (" << avg->r << "," << avg->g << "," << avg->b
-          << ") fmt" << static_cast<uint32_t>(rb.format);
-        reshade::log::message(reshade::log::level::info, s.str().c_str());
-      }
-    }
-    rb.staging = {};
-  }
-  if (rb.staging.handle != 0u) return;  // still waiting for the GPU
-
-  // 2. a star seen this frame: copy a window around it out of the scene target
-  StarProbe p;
-  int light = -1;
-  {
-    StateLock lock;
-    for (int i = 0; i < 2 && light < 0; ++i) {
-      if (!probe[i].want || probe[i].frame != frame_index) continue;
-      probe[i].want = false;
-      if (frame_index - probe[i].last_sampled < kProbePeriod) continue;
-      p = probe[i];
-      light = i;
-    }
-  }
-  if (light < 0) return;
+// Called from OnBindRenderTargets, lock not held.
+inline void CopyStarWindow(reshade::api::command_list* cmd_list, const StarProbe& p, int light) {
+  auto* device = cmd_list->get_device();
   const auto desc = device->get_resource_desc(p.target);
   if (desc.type != reshade::api::resource_type::texture_2d) return;
+  {
+    StateLock lock;
+    if (backbuffer_width == 0 || desc.texture.width * 2 < backbuffer_width) {  // side pass, not the main view
+      ++stat_probes_skipped;
+      return;
+    }
+  }
   if (desc.texture.samples > 1) {
     StateLock lock;
     if (!readback.warned_msaa) {
@@ -774,20 +744,99 @@ inline void RunStarReadback(reshade::api::command_queue* queue) {
   if (left < 0 || top < 0 || left + kProbeBox > static_cast<int>(desc.texture.width)
       || top + kProbeBox > static_cast<int>(desc.texture.height))
     return;
-  const reshade::api::resource_desc staging_desc(kProbeBox, kProbeBox, 1, 1, desc.texture.format, 1,
-                                                 reshade::api::memory_heap::gpu_to_cpu,
-                                                 reshade::api::resource_usage::copy_dest);
+
+  // staging texture: kept across samples, replaced when the format changes
   reshade::api::resource staging{};
-  if (!device->create_resource(staging_desc, nullptr, reshade::api::resource_usage::copy_dest, &staging)) return;
+  reshade::api::resource stale{};
+  {
+    StateLock lock;
+    if (readback.staging.handle != 0u && readback.format != desc.texture.format) {
+      stale = readback.staging;
+      readback.staging = {};
+    }
+    staging = readback.staging;
+  }
+  if (stale.handle != 0u) device->destroy_resource(stale);
+  if (staging.handle == 0u) {
+    const reshade::api::resource_desc staging_desc(kProbeBox, kProbeBox, 1, 1, desc.texture.format, 1,
+                                                   reshade::api::memory_heap::gpu_to_cpu,
+                                                   reshade::api::resource_usage::copy_dest);
+    if (!device->create_resource(staging_desc, nullptr, reshade::api::resource_usage::copy_dest, &staging)) return;
+  }
   reshade::api::subresource_box box{static_cast<uint32_t>(left), static_cast<uint32_t>(top), 0,
                                     static_cast<uint32_t>(left + kProbeBox), static_cast<uint32_t>(top + kProbeBox), 1};
-  queue->get_immediate_command_list()->copy_texture_region(p.target, 0, &box, staging, 0, nullptr);
+  cmd_list->copy_texture_region(p.target, 0, &box, staging, 0, nullptr);
   StateLock lock;
   readback.staging = staging;
   readback.format = desc.texture.format;
+  readback.pending = true;
   readback.frame = frame_index;
   readback.light = light;
+  readback.target = p.target.handle;
+  readback.width = desc.texture.width;
+  readback.height = desc.texture.height;
+  readback.px = left + half;
+  readback.py = top + half;
   probe[light].last_sampled = frame_index;
+}
+
+// Called at present, before EndFrame, lock not held: maps a finished copy and
+// folds it into the light's measured colour.
+inline void RunStarReadback(reshade::api::command_queue* queue) {
+  auto* device = queue->get_device();
+  Readback rb;
+  {
+    StateLock lock;
+    if (!readback.pending || frame_index - readback.frame < kReadbackDelay) return;
+    rb = readback;
+  }
+  reshade::api::subresource_data mapped{};
+  std::optional<Rgb> avg;
+  float max_luma = 0.f;
+  if (device->map_texture_region(rb.staging, 0, nullptr, reshade::api::map_access::read_only, &mapped)) {
+    avg = AverageTexels(rb.format, kProbeBox, kProbeBox, static_cast<const uint8_t*>(mapped.data), mapped.row_pitch,
+                        &max_luma);
+    device->unmap_texture_region(rb.staging, 0);
+  }
+  StateLock lock;
+  readback.pending = false;
+  ++stat_readbacks;
+  if (!avg.has_value()) {
+    if (!readback.warned_format) {
+      readback.warned_format = true;
+      std::stringstream s;
+      s << "starlight readback: scene format " << static_cast<uint32_t>(rb.format) << " not decoded";
+      reshade::log::message(reshade::log::level::info, s.str().c_str());
+    }
+    return;
+  }
+  // Bright samples dominate (accumulated in linear light), and samples far
+  // dimmer than the brightest seen are not the star at all (a strut in front,
+  // empty space): they are dropped rather than allowed to decay it.
+  LightState& l = lights[rb.light];
+  const float y = Luma(*avg);
+  // The star's core in the HDR scene is far brighter than anything else that
+  // could be at its position (sky, a strut); a window without such a pixel is
+  // not the star.
+  const bool accept = y > 0.f && max_luma >= kMinPeakPixelLuma && y >= kMinSampleFraction * l.measured_peak;
+  if (accept) {
+    l.measured_peak = std::max(l.measured_peak, y);
+    const float keep = l.measured_valid ? kMeasureDecay : 0.f;
+    l.measured_acc = {l.measured_acc.r * keep + avg->r, l.measured_acc.g * keep + avg->g, l.measured_acc.b * keep + avg->b};
+    l.measured_valid = true;
+    ++l.measured_samples;
+  }
+  if (config.probe_log != 0.f && stat_readbacks <= kReadbackLogCap) {
+    const float s3 = l.measured_acc.r + l.measured_acc.g + l.measured_acc.b;
+    std::stringstream s;
+    s << "starlight readback: light " << rb.light + 1 << (accept ? " sample (" : " dropped (") << avg->r << "," << avg->g
+      << "," << avg->b << ") luma " << y << " brightest " << max_luma << " peak " << l.measured_peak << " from "
+      << std::hex << rb.target << std::dec
+      << " " << rb.width << "x" << rb.height << " fmt" << static_cast<uint32_t>(rb.format) << " at " << rb.px << ","
+      << rb.py << " -> chroma (" << (s3 > 0 ? l.measured_acc.r / s3 : 0) << "," << (s3 > 0 ? l.measured_acc.g / s3 : 0)
+      << "," << (s3 > 0 ? l.measured_acc.b / s3 : 0) << ")";
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
 }
 
 // ---- star draw -------------------------------------------------------------
@@ -895,7 +944,8 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
         if (star.fx == StarFx::Surface && sc[3] > 0.f && bit->second.rt0.handle != 0u) {
           const float nx = sc[0] / sc[3], ny = sc[1] / sc[3];
           if (std::abs(nx) < 0.95f && std::abs(ny) < 0.95f)
-            probe[i] = {true, bit->second.rt0, {nx, ny}, frame_index, probe[i].last_sampled};
+            probe[i] = {true, bit->second.rt0, {nx, ny}, frame_index, reinterpret_cast<uint64_t>(cmd_list),
+                        probe[i].last_sampled};
         }
       }
     }
@@ -930,6 +980,7 @@ inline void EndFrame() {
     if (!l.known) {
       l.measured_valid = false;  // a new star: measure afresh
       l.measured_samples = 0;
+      l.measured_peak = 0.f;
     }
     const FrameMatch& fm = frame_match[i];
     if (fm.any) {
@@ -937,6 +988,8 @@ inline void EndFrame() {
       if (l.known && sig != l.signature) {
         l.measured_valid = false;
         l.measured_samples = 0;
+        l.measured_peak = 0.f;
+      l.measured_peak = 0.f;
       }
       l.known = true;
       l.source = fm.fx;
@@ -1119,8 +1172,27 @@ inline void OnBindRenderTargets(reshade::api::command_list* cmd_list, uint32_t c
   if (in_state_lock) return;
   reshade::api::resource rt{};
   if (count > 0 && rtvs != nullptr && rtvs[0].handle != 0u) rt = cmd_list->get_device()->get_resource_from_view(rtvs[0]);
-  StateLock lock;
-  bindings[reinterpret_cast<uint64_t>(cmd_list)].rt0 = rt;
+  // The target the star was drawn into is being switched away: the star pass
+  // is complete, copy the window out now (before anything reuses the target).
+  StarProbe p;
+  int light = -1;
+  {
+    StateLock lock;
+    auto& b = bindings[reinterpret_cast<uint64_t>(cmd_list)];
+    const auto previous = b.rt0;
+    b.rt0 = rt;
+    if (previous.handle != 0u && previous.handle != rt.handle && !readback.pending) {
+      for (int i = 0; i < 2 && light < 0; ++i) {
+        StarProbe& q = probe[i];
+        if (!q.want || q.cmd_list != reinterpret_cast<uint64_t>(cmd_list) || q.target.handle != previous.handle) continue;
+        q.want = false;
+        if (q.frame != frame_index || frame_index - q.last_sampled < kProbePeriod) continue;
+        p = q;
+        light = i;
+      }
+    }
+  }
+  if (light >= 0) CopyStarWindow(cmd_list, p, light);
 }
 
 inline void OnMapBufferRegion(reshade::api::device*, reshade::api::resource resource, uint64_t offset, uint64_t,
@@ -1253,8 +1325,17 @@ inline void OnPushDescriptors(reshade::api::command_list* cmd_list, reshade::api
   }
 }
 
-inline void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain*, const reshade::api::rect*,
+inline void OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*,
                       const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  if (swapchain != nullptr && queue != nullptr) {
+    const auto bb = swapchain->get_current_back_buffer();
+    if (bb.handle != 0u) {
+      const auto desc = queue->get_device()->get_resource_desc(bb);
+      StateLock lock;
+      backbuffer_width = desc.texture.width;
+      backbuffer_height = desc.texture.height;
+    }
+  }
   if (queue != nullptr) RunStarReadback(queue);
   EndFrame();
 }
@@ -1382,7 +1463,8 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                         hot_kinds.size(), stat_list_patched, scan_frames_left > 0 ? "  [scanning]" : "");
             ImGui::Text("GlobalViewData per frame: %u uploads, colour variants %u / %u",
                         stat_gvd_per_frame, stat_variants[0], stat_variants[1]);
-            ImGui::Text("Learned signatures: %zu   star readbacks: %u", learned.size(), stat_readbacks);
+            ImGui::Text("Learned signatures: %zu   star readbacks: %u (%u side-pass probes skipped)", learned.size(),
+                        stat_readbacks, stat_probes_skipped);
             return false;
           },
       },
