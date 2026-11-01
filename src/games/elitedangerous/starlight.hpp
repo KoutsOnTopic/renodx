@@ -447,6 +447,30 @@ inline void SaveSignatures() {  // call with state_mutex held
   for (auto& [k, v] : learned) f << k << " = " << v << "\n";
 }
 
+// Learned classes are keyed by the signature rounded to 3 decimals, and a
+// star of the same class can land one rounding step away (an L dwarf at
+// 0.625,0.242 against a learned 0.624,0.242). Exact match first, otherwise
+// the nearest learned signature of the same draw kind within the tolerance,
+// which is far below the distance between classes.
+constexpr float kSignatureTolerance = 0.004f;
+inline std::string LookupClass(const std::string& sig) {
+  if (sig.empty()) return {};
+  if (auto it = learned.find(sig); it != learned.end()) return it->second;
+  const auto colon = sig.find(':');
+  float r, g;
+  if (colon == std::string::npos || std::sscanf(sig.c_str() + colon + 1, "%f,%f", &r, &g) != 2) return {};
+  std::string best;
+  float best_d = kSignatureTolerance;
+  for (const auto& [k, v] : learned) {
+    if (k.size() <= colon || k.compare(0, colon + 1, sig, 0, colon + 1) != 0) continue;
+    float kr, kg;
+    if (std::sscanf(k.c_str() + colon + 1, "%f,%f", &kr, &kg) != 2) continue;
+    const float d = std::max(std::abs(kr - r), std::abs(kg - g));
+    if (d <= best_d) best_d = d, best = v;
+  }
+  return best;
+}
+
 inline const Rgb* LookupClassColour(const std::string& cls) {
   if (cls.empty()) return nullptr;
   if (auto it = colour_table.find(cls); it != colour_table.end()) return &it->second;
@@ -1142,8 +1166,7 @@ inline void EndFrame() {
       l.match_cos = fm.cos;
       l.frames_since_match = 0;
       l.signature = sig;
-      auto it = learned.find(l.signature);
-      l.cls = it != learned.end() ? it->second : std::string{};
+      l.cls = LookupClass(l.signature);
     } else {
       ++l.frames_since_match;
     }
