@@ -237,6 +237,12 @@ struct LightState {
   Rgb measured_acc;
   uint32_t measured_samples = 0;
   float measured_peak = 0.f;  // brightest sample so far; much dimmer ones are not the star
+  // The light's unattenuated colour: component-wise maximum of the colour
+  // variants the engine uploaded for it this frame and last. Passes inside an
+  // atmosphere carry the same light filtered by transmittance (each channel
+  // scaled down); recolouring relative to this base keeps that filtering.
+  bool base_valid = false;
+  Rgb base_colour;
 };
 
 struct FrameMatch {
@@ -441,8 +447,16 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   }
   Rgb out = in;
   if (target != nullptr && Luma(*target) > 0.f) {
-    const float k = y / Luma(*target), s = config.strength;
-    out = {in.r + (target->r * k - in.r) * s, in.g + (target->g * k - in.g) * s, in.b + (target->b * k - in.b) * s};
+    // Multiplicative recolouring: the per-channel gain that turns the light's
+    // unattenuated colour into the target chroma at unchanged luminance, then
+    // applied to this copy. A copy already filtered by the atmosphere keeps
+    // that filter on top of the new colour; outside an atmosphere base == in.
+    const Rgb base = l.base_valid ? l.base_colour : in;
+    const float yb = Luma(base), k = yb / Luma(*target), s = config.strength;
+    const float floor = 1e-6f * yb;  // a zero channel in the base cannot be scaled: keep it tiny
+    const Rgb gain{target->r * k / std::max(base.r, floor), target->g * k / std::max(base.g, floor),
+                   target->b * k / std::max(base.b, floor)};
+    out = {in.r + (in.r * gain.r - in.r) * s, in.g + (in.g * gain.g - in.g) * s, in.b + (in.b * gain.b - in.b) * s};
   }
   return Saturate(out, config.saturation);
 }
@@ -1047,6 +1061,22 @@ inline void EndFrame() {
   stat_list_matched_frame = 0;
   stat_gvd_per_frame = frame_gvd_uploads;
   for (int i = 0; i < 2; ++i) stat_variants[i] = static_cast<uint32_t>(frame_keys[i].size());
+  // unattenuated light colour = component-wise max of this frame's and last frame's variants
+  for (int i = 0; i < 2; ++i) {
+    Rgb mx{0, 0, 0};
+    bool any = false;
+    for (const auto* set : {&frame_keys[i], &prev_keys[i]})
+      for (const ColourKey& k : *set) {
+        float c[3];
+        std::memcpy(c, k.w, sizeof(c));
+        mx = {std::max(mx.r, c[0]), std::max(mx.g, c[1]), std::max(mx.b, c[2])};
+        any = true;
+      }
+    if (any) {
+      lights[i].base_colour = mx;
+      lights[i].base_valid = true;
+    }
+  }
   prev_keys = std::move(frame_keys);
   for (auto& k : frame_keys) k.clear();
   frame_gvd_uploads = 0;
@@ -1428,7 +1458,8 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                 ImGui::Text("Light %d: off", i + 1);
                 continue;
               }
-              ImGui::Text("Light %d: game %.3f %.3f %.3f", i + 1, l.game_colour.r, l.game_colour.g, l.game_colour.b);
+              ImGui::Text("Light %d: game %.3f %.3f %.3f   unattenuated %.3f %.3f %.3f", i + 1, l.game_colour.r,
+                          l.game_colour.g, l.game_colour.b, l.base_colour.r, l.base_colour.g, l.base_colour.b);
               if (l.known) {
                 ImGui::Text("   star via %s  %.3f %.3f %.3f  cos %.5f%s  %u frames ago",
                             FxName(l.source), l.star_colour.r, l.star_colour.g, l.star_colour.b, l.match_cos,
