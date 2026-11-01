@@ -245,6 +245,19 @@ struct LightState {
   // scaled down); recolouring relative to this base keeps that filtering.
   bool base_valid = false;
   Rgb base_colour;
+  // The tint actually applied (chromaticity, sum 1) and its class saturation.
+  // On a hand-over inside a system it rolls over from the previous star's
+  // values over kRolloverSeconds; on arrival it switches at once.
+  bool applied_valid = false;
+  Rgb applied;                 // current
+  float applied_sat = 1.f;
+  Rgb roll_from;               // start of the roll-over
+  float roll_from_sat = 1.f;
+  bool rolling = false;
+  std::chrono::steady_clock::time_point roll_start{};
+  std::string applied_identity;  // signature the goal belongs to
+  uint64_t applied_frame = 0;    // last frame the goal was computed
+  uint64_t applied_arrival = 0;  // arrival_seq at that time
 };
 
 struct FrameMatch {
@@ -555,6 +568,72 @@ inline const Rgb* StarColourFor(const LightState& l, Rgb& out, StarSource* used 
   }
 }
 
+// The colour the current mode wants for this light, or nullptr for "leave
+// the game's light alone".
+inline const Rgb* GoalColour(const LightState& l, Rgb& out) {
+  const Rgb* target = nullptr;
+  if (config.mode == 2.f) target = LookupClassColour(l.cls);
+  if (target == nullptr) target = StarColourFor(l, out);
+  else out = *target, target = &out;
+  return target;
+}
+
+constexpr float kRolloverSeconds = 2.5f;   // hand-over inside a system: roll the tint over this long
+constexpr uint64_t kHandoverGapFrames = 120;  // identified again within this: a hand-over, not an arrival
+
+inline Rgb Chromaticity(const Rgb& c) {
+  const float sum = c.r + c.g + c.b;
+  return sum > 0.f ? Rgb{c.r / sum, c.g / sum, c.b / sum} : Rgb{1.f / 3, 1.f / 3, 1.f / 3};
+}
+
+// Once per frame (EndFrame, lock held): computes the goal and rolls the
+// applied tint towards it. A goal of "vanilla" is the light's own
+// chromaticity, so a class set to vanilla blends in and out like any other.
+inline void UpdateApplied(LightState& l, uint64_t arrival) {
+  if (!l.known || config.mode == 0.f) {
+    l.rolling = false;
+    return;
+  }
+  Rgb tmp;
+  const Rgb* goal_ptr = GoalColour(l, tmp);
+  Rgb goal;
+  if (goal_ptr != nullptr && Luma(*goal_ptr) > 0.f) goal = Chromaticity(*goal_ptr);
+  else if (l.base_valid && Luma(l.base_colour) > 0.f) goal = Chromaticity(l.base_colour);
+  else return;
+  const float goal_sat = LookupClassSaturation(l.cls);
+  const auto now = std::chrono::steady_clock::now();
+
+  if (l.applied_valid && l.applied_identity != l.signature) {
+    // another star: a hand-over if the previous one was applied a moment
+    // ago in the same system, otherwise (arrival after a jump) switch at once
+    const bool handover = frame_index - l.applied_frame < kHandoverGapFrames && arrival == l.applied_arrival;
+    if (handover) {
+      l.roll_from = l.applied;
+      l.roll_from_sat = l.applied_sat;
+      l.roll_start = now;
+      l.rolling = true;
+    } else {
+      l.rolling = false;
+    }
+  }
+  if (!l.applied_valid) l.rolling = false;
+  l.applied_identity = l.signature;
+  l.applied_frame = frame_index;
+  l.applied_arrival = arrival;
+
+  float t = 1.f;
+  if (l.rolling) {
+    t = std::chrono::duration<float>(now - l.roll_start).count() / kRolloverSeconds;
+    if (t >= 1.f) t = 1.f, l.rolling = false;
+    t = t * t * (3.f - 2.f * t);  // ease in and out
+  }
+  l.applied = l.rolling ? Chromaticity({l.roll_from.r + (goal.r - l.roll_from.r) * t, l.roll_from.g + (goal.g - l.roll_from.g) * t,
+                                        l.roll_from.b + (goal.b - l.roll_from.b) * t})
+                        : goal;
+  l.applied_sat = l.rolling ? l.roll_from_sat + (goal_sat - l.roll_from_sat) * t : goal_sat;
+  l.applied_valid = true;
+}
+
 // Chroma comes from the chosen source; luminance stays exactly the game's.
 inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   const float y = Luma(in);
@@ -562,9 +641,13 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
 
   const Rgb* target = nullptr;
   Rgb star;
-  if (l.known) {
-    if (config.mode == 2.f) target = LookupClassColour(l.cls);
-    if (target == nullptr) target = StarColourFor(l, star);  // nullptr: this class is left vanilla
+  float class_sat = 1.f;
+  if (l.known && l.applied_valid) {
+    target = &l.applied;  // the goal colour, rolled over on hand-overs (see UpdateApplied)
+    class_sat = l.applied_sat;
+  } else if (l.known) {
+    target = GoalColour(l, star);
+    class_sat = LookupClassSaturation(l.cls);
   }
   Rgb out = in;
   if (target != nullptr && Luma(*target) > 0.f) {
@@ -581,7 +664,7 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   }
   // the class's own chroma multiplier ("Y.saturation = 1.5": the game's Y dwarf
   // light has the right hue, only bland) on top of the global slider
-  return Saturate(out, config.saturation * (l.known ? LookupClassSaturation(l.cls) : 1.f));
+  return Saturate(out, config.saturation * class_sat);
 }
 
 // ---- GlobalViewData upload -------------------------------------------------
@@ -1205,6 +1288,8 @@ inline void EndFrame() {
     }
   }
 
+  for (auto& l : lights) UpdateApplied(l, arrival_seq);
+
   // Teacher: just after arriving, light 0 is the arrival star.
   if (config.auto_learn != 0.f && arrival_seq != arrival_seq_used && !arrival_class.empty()) {
     if (arrival_frame == 0) arrival_frame = frame_index;
@@ -1663,6 +1748,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                   ImGui::Text("   seen on screen: chroma %.3f %.3f %.3f  sat %.2f hue %.0f  (%u samples, %u of last %u used)",
                               l.measured_acc.r / s, l.measured_acc.g / s, l.measured_acc.b / s,
                               Saturation(l.measured_acc), Hue(l.measured_acc), l.measured_samples, l.measured_used, l.ring_count);
+                  if (l.rolling) ImGui::Text("   rolling over from the previous star");
                   const float su = used != nullptr ? used->r + used->g + used->b : 1.f;
                   ImGui::Text("   policy for class %s (saturation x%.2f): %s%s%.3f %.3f %.3f",
                               l.cls.empty() ? "(unlearned)" : l.cls.c_str(), LookupClassSaturation(l.cls),
