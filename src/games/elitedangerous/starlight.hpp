@@ -234,9 +234,11 @@ struct LightState {
   uint32_t frames_inactive = 0;
   // measured from the rendered star (see StarProbe); reset with the identity
   bool measured_valid = false;
-  Rgb measured_acc;
-  uint32_t measured_samples = 0;
-  float measured_peak = 0.f;  // brightest sample so far; much dimmer ones are not the star
+  Rgb measured_acc;           // robust estimate over the ring (linear light)
+  uint32_t measured_samples = 0, measured_used = 0;
+  float measured_peak = 0.f;  // brightest sample recently; much dimmer ones are not the star
+  std::array<Rgb, 32> ring{}; // the last accepted samples
+  uint32_t ring_count = 0, ring_pos = 0;
   // The light's unattenuated colour: component-wise maximum of the colour
   // variants the engine uploaded for it this frame and last. Passes inside an
   // atmosphere carry the same light filtered by transmittance (each channel
@@ -289,13 +291,14 @@ inline uint32_t stat_readbacks = 0, stat_probes_skipped = 0;
 // the main view is sampled: a target at least half the back buffer's width
 // (the scene may render below output resolution with upscaling).
 inline uint32_t backbuffer_width = 0, backbuffer_height = 0;
-constexpr int kProbeBox = 16;            // pixels, square window at the star centre
+constexpr int kProbeBox = 48;            // pixels, square window at the star centre (averages disc patches)
 constexpr uint64_t kProbePeriod = 10;    // frames between samples of the same light
 constexpr uint64_t kReadbackDelay = 3;   // frames before mapping the copy
-constexpr float kMeasureDecay = 0.8f;    // accumulation memory per sample
+constexpr float kPeakDecay = 0.95f;      // per accepted sample
+constexpr float kChromaInlier = 0.60f;   // L1 chromaticity distance from the median to count (a disc with two patch colours ~0.6 apart must average, not flip)
 constexpr float kMinSampleFraction = 0.02f;  // of the brightest sample; dimmer ones are ignored
-constexpr uint32_t kReadbackLogCap = 300;     // probe log: samples logged per session
-constexpr float kMinPeakPixelLuma = 1.0f;     // HDR scene units; the star core exceeds this
+constexpr uint32_t kReadbackLogPerStar = 30;  // probe log: samples logged per identified star, then 1 in 50
+constexpr float kMinPeakPixelLuma = 0.015f;   // HDR scene units: sky is ~0.004, a brown dwarf's disc ~0.04, hot stars >> 1
 
 inline std::mutex state_mutex;
 // ReShade raises destroy_resource from inside D3D calls (the runtime fires
@@ -347,6 +350,10 @@ inline uint32_t stat_gvd_per_frame = 0, stat_variants[2] = {0, 0};
 constexpr uint32_t kForgetAfterFrames = 1800;
 
 inline std::map<std::string, Rgb> colour_table;       // class -> colour
+// class -> how "Star Colour" picks that class's colour ("<class>.source = ..." in the ini)
+enum class StarSource { Constant, Measured, Table, Vanilla };
+inline std::map<std::string, StarSource> class_policy;
+inline std::map<std::string, float> class_saturation;  // class -> extra chroma multiplier ("<class>.saturation = 1.5")
 inline std::map<std::string, std::string> learned;    // signature -> class
 inline std::string table_path, signatures_path;
 
@@ -404,7 +411,23 @@ inline void LoadTables() {
       if (!key.empty() && !val.empty()) fn(key, val);
     }
   };
+  std::map<std::string, StarSource> policy;
+  std::map<std::string, float> saturation;
   parse(table_path, [&](const std::string& k, const std::string& v) {
+    if (k.size() > 11 && k.compare(k.size() - 11, 11, ".saturation") == 0) {
+      std::istringstream f(v);
+      float x;
+      if ((f >> x) && x >= 0.f) saturation[k.substr(0, k.size() - 11)] = x;
+      return;
+    }
+    if (k.size() > 7 && k.compare(k.size() - 7, 7, ".source") == 0) {
+      const std::string cls = k.substr(0, k.size() - 7);
+      if (v == "constant") policy[cls] = StarSource::Constant;
+      else if (v == "measured") policy[cls] = StarSource::Measured;
+      else if (v == "table") policy[cls] = StarSource::Table;
+      else if (v == "vanilla") policy[cls] = StarSource::Vanilla;
+      return;
+    }
     std::istringstream s(v);
     Rgb c;
     if ((s >> c.r >> c.g >> c.b) && c.r >= 0 && c.g >= 0 && c.b >= 0) table[k] = c;
@@ -412,6 +435,8 @@ inline void LoadTables() {
   parse(signatures_path, [&](const std::string& k, const std::string& v) { sigs[k] = v; });
   StateLock lock;
   colour_table = std::move(table);
+  class_policy = std::move(policy);
+  class_saturation = std::move(saturation);
   learned = std::move(sigs);
 }
 
@@ -431,6 +456,68 @@ inline const Rgb* LookupClassColour(const std::string& cls) {
 }
 
 // ---- colour remap ----------------------------------------------------------
+// Saturation in the HSV sense, 0 = grey, 1 = a pure hue.
+inline float Saturation(const Rgb& c) {
+  const float mx = std::max({c.r, c.g, c.b}), mn = std::min({c.r, c.g, c.b});
+  return mx > 0.f ? 1.f - mn / mx : 0.f;
+}
+
+// Hue angle in degrees (HSV), 0 = red, 120 = green, 240 = blue.
+inline float Hue(const Rgb& c) {
+  const float mx = std::max({c.r, c.g, c.b}), mn = std::min({c.r, c.g, c.b}), d = mx - mn;
+  if (!(d > 0.f)) return 0.f;
+  float h;
+  if (mx == c.r) h = (c.g - c.b) / d;
+  else if (mx == c.g) h = 2.f + (c.b - c.r) / d;
+  else h = 4.f + (c.r - c.g) / d;
+  h *= 60.f;
+  return h < 0.f ? h + 360.f : h;
+}
+inline float HueDistance(const Rgb& a, const Rgb& b) {
+  const float d = std::abs(Hue(a) - Hue(b));
+  return d > 180.f ? 360.f - d : d;
+}
+
+// Policy for a class, with the same prefix fallback as the colour table
+// ("K_OrangeGiant" -> "K"); unlearned classes get the default.
+inline StarSource LookupPolicy(const std::string& cls) {
+  if (cls.empty()) return StarSource::Constant;
+  if (auto it = class_policy.find(cls); it != class_policy.end()) return it->second;
+  for (size_t n = cls.size() - 1; n > 0; --n)
+    if (auto it = class_policy.find(cls.substr(0, n)); it != class_policy.end()) return it->second;
+  return StarSource::Constant;
+}
+
+inline float LookupClassSaturation(const std::string& cls) {
+  if (cls.empty()) return 1.f;
+  if (auto it = class_saturation.find(cls); it != class_saturation.end()) return it->second;
+  for (size_t n = cls.size() - 1; n > 0; --n)
+    if (auto it = class_saturation.find(cls.substr(0, n)); it != class_saturation.end()) return it->second;
+  return 1.f;
+}
+
+// The star's colour for "Star Colour" mode. The default is the star's own
+// constant (the designers' hue), which looks right for ordinary classes.
+// Classes that look odd with it get a policy in renodx-starlight.ini:
+//   measured  the rendered disc's colour (brown dwarfs: magenta texture over
+//             a blue constant)
+//   table     that class's colour from the ini
+//   vanilla   leave the game's light alone
+// Returns nullptr when the light is to be left as the game made it.
+inline const Rgb* StarColourFor(const LightState& l, Rgb& out, StarSource* used = nullptr) {
+  StarSource src = LookupPolicy(l.cls);
+  // not sampled yet: the class's table colour is a better stand-in than the constant
+  if (src == StarSource::Measured && !(l.measured_valid && Luma(l.measured_acc) > 0.f)) src = StarSource::Table;
+  if (src == StarSource::Table && LookupClassColour(l.cls) == nullptr) src = StarSource::Constant;
+  if (used != nullptr) *used = src;
+  switch (src) {
+    case StarSource::Measured: out = l.measured_acc; return &out;
+    case StarSource::Table: out = *LookupClassColour(l.cls); return &out;
+    case StarSource::Vanilla: return nullptr;
+    default: out = l.star_colour; return &out;
+  }
+}
+
 // Chroma comes from the chosen source; luminance stays exactly the game's.
 inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   const float y = Luma(in);
@@ -440,10 +527,7 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   Rgb star;
   if (l.known) {
     if (config.mode == 2.f) target = LookupClassColour(l.cls);
-    if (target == nullptr) {
-      star = l.measured_valid ? l.measured_acc : l.star_colour;  // measured when the star has been seen
-      target = &star;
-    }
+    if (target == nullptr) target = StarColourFor(l, star);  // nullptr: this class is left vanilla
   }
   Rgb out = in;
   if (target != nullptr && Luma(*target) > 0.f) {
@@ -458,7 +542,9 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
                    target->b * k / std::max(base.b, floor)};
     out = {in.r + (in.r * gain.r - in.r) * s, in.g + (in.g * gain.g - in.g) * s, in.b + (in.b * gain.b - in.b) * s};
   }
-  return Saturate(out, config.saturation);
+  // the class's own chroma multiplier ("Y.saturation = 1.5": the game's Y dwarf
+  // light has the right hue, only bland) on top of the global slider
+  return Saturate(out, config.saturation * (l.known ? LookupClassSaturation(l.cls) : 1.f));
 }
 
 // ---- GlobalViewData upload -------------------------------------------------
@@ -794,6 +880,38 @@ inline void CopyStarWindow(reshade::api::command_list* cmd_list, const StarProbe
   probe[light].last_sampled = frame_index;
 }
 
+// Colour of a star from its recent samples. The disc is not one colour (a Y
+// dwarf alternates red and magenta patches) and the odd sample is something
+// else entirely (a lit strut crossing the star), so instead of a running
+// average: per-channel median of the samples' chromaticities, then the
+// luminance-weighted mean of the samples near that median. Outliers are
+// ignored, patches average out.
+inline Rgb RobustColour(const std::array<Rgb, 32>& ring, uint32_t n, uint32_t* used) {
+  std::array<std::array<float, 3>, 32> chroma{};
+  std::array<float, 32> ch{};
+  float median[3];
+  for (uint32_t i = 0; i < n; ++i) {
+    const float sum = ring[i].r + ring[i].g + ring[i].b;
+    chroma[i] = sum > 0.f ? std::array<float, 3>{ring[i].r / sum, ring[i].g / sum, ring[i].b / sum} : std::array<float, 3>{0, 0, 0};
+  }
+  for (int k = 0; k < 3; ++k) {
+    for (uint32_t i = 0; i < n; ++i) ch[i] = chroma[i][k];
+    std::sort(ch.begin(), ch.begin() + n);
+    median[k] = n % 2 == 1 ? ch[n / 2] : 0.5f * (ch[n / 2 - 1] + ch[n / 2]);
+  }
+  Rgb acc{0, 0, 0};
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const float d = std::abs(chroma[i][0] - median[0]) + std::abs(chroma[i][1] - median[1]) + std::abs(chroma[i][2] - median[2]);
+    if (d > kChromaInlier) continue;
+    acc = {acc.r + ring[i].r, acc.g + ring[i].g, acc.b + ring[i].b};
+    ++kept;
+  }
+  if (used != nullptr) *used = kept;
+  if (kept == 0) return {median[0], median[1], median[2]};
+  return acc;
+}
+
 // Called at present, before EndFrame, lock not held: maps a finished copy and
 // folds it into the light's measured colour.
 inline void RunStarReadback(reshade::api::command_queue* queue) {
@@ -834,13 +952,17 @@ inline void RunStarReadback(reshade::api::command_queue* queue) {
   // not the star.
   const bool accept = y > 0.f && max_luma >= kMinPeakPixelLuma && y >= kMinSampleFraction * l.measured_peak;
   if (accept) {
-    l.measured_peak = std::max(l.measured_peak, y);
-    const float keep = l.measured_valid ? kMeasureDecay : 0.f;
-    l.measured_acc = {l.measured_acc.r * keep + avg->r, l.measured_acc.g * keep + avg->g, l.measured_acc.b * keep + avg->b};
+    // the peak forgets slowly, so a far (dim) star or one bright foreign
+    // sample does not lock the gate for good
+    l.measured_peak = std::max(l.measured_peak * kPeakDecay, y);
+    l.ring[l.ring_pos] = *avg;
+    l.ring_pos = (l.ring_pos + 1) % static_cast<uint32_t>(l.ring.size());
+    l.ring_count = std::min<uint32_t>(l.ring_count + 1, static_cast<uint32_t>(l.ring.size()));
+    l.measured_acc = RobustColour(l.ring, l.ring_count, &l.measured_used);
     l.measured_valid = true;
     ++l.measured_samples;
   }
-  if (config.probe_log != 0.f && stat_readbacks <= kReadbackLogCap) {
+  if (config.probe_log != 0.f && (l.measured_samples <= kReadbackLogPerStar || stat_readbacks % 50 == 0)) {
     const float s3 = l.measured_acc.r + l.measured_acc.g + l.measured_acc.b;
     std::stringstream s;
     s << "starlight readback: light " << rb.light + 1 << (accept ? " sample (" : " dropped (") << avg->r << "," << avg->g
@@ -995,6 +1117,8 @@ inline void EndFrame() {
       l.measured_valid = false;  // a new star: measure afresh
       l.measured_samples = 0;
       l.measured_peak = 0.f;
+      l.measured_acc = {};
+      l.ring_count = l.ring_pos = l.measured_used = 0;
     }
     const FrameMatch& fm = frame_match[i];
     if (fm.any) {
@@ -1003,7 +1127,14 @@ inline void EndFrame() {
         l.measured_valid = false;
         l.measured_samples = 0;
         l.measured_peak = 0.f;
+        l.measured_acc = {};
+        l.ring_count = l.ring_pos = l.measured_used = 0;
+      l.ring_count = l.ring_pos = l.measured_used = 0;
+      l.measured_acc = {};
+      l.ring_count = l.ring_pos = l.measured_used = 0;
       l.measured_peak = 0.f;
+      l.measured_acc = {};
+      l.ring_count = l.ring_pos = l.measured_used = 0;
       }
       l.known = true;
       l.source = fm.fx;
@@ -1466,8 +1597,20 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                 ImGui::Text("   %s  class: %s", l.signature.c_str(), l.cls.empty() ? "unlearned" : l.cls.c_str());
                 if (l.measured_valid) {
                   const float s = l.measured_acc.r + l.measured_acc.g + l.measured_acc.b;
-                  ImGui::Text("   seen on screen: chroma %.3f %.3f %.3f  (%u samples)", l.measured_acc.r / s,
-                              l.measured_acc.g / s, l.measured_acc.b / s, l.measured_samples);
+                  StarSource src;
+                  Rgb chosen;
+                  const Rgb* used = StarColourFor(l, chosen, &src);
+                  ImGui::Text("   seen on screen: chroma %.3f %.3f %.3f  sat %.2f hue %.0f  (%u samples, %u of last %u used)",
+                              l.measured_acc.r / s, l.measured_acc.g / s, l.measured_acc.b / s,
+                              Saturation(l.measured_acc), Hue(l.measured_acc), l.measured_samples, l.measured_used, l.ring_count);
+                  const float su = used != nullptr ? used->r + used->g + used->b : 1.f;
+                  ImGui::Text("   policy for class %s (saturation x%.2f): %s%s%.3f %.3f %.3f",
+                              l.cls.empty() ? "(unlearned)" : l.cls.c_str(), LookupClassSaturation(l.cls),
+                              src == StarSource::Measured ? "measured" : src == StarSource::Table ? "class table"
+                              : src == StarSource::Vanilla ? "vanilla" : "constant",
+                              used != nullptr ? ", using chroma " : " (light left as the game made it) ",
+                              used != nullptr ? used->r / su : 0.f, used != nullptr ? used->g / su : 0.f,
+                              used != nullptr ? used->b / su : 0.f);
                 } else {
                   ImGui::TextUnformatted("   seen on screen: not measured yet (using the star's constant)");
                 }
