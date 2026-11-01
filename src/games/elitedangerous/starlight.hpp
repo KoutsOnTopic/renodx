@@ -19,8 +19,10 @@
  * planet surfaces. One 48-byte record per directional light, count in
  * g_numDirectionalLights (b1 c245.y):
  *   +0  float3 colour   (shaders multiply by 1/pi)
- *   +16 float3 direction (same convention as gDirectionalLightDir)
- *   Records are recognised by matching their direction to the b1 lights.
+ *   +16 float3 direction (camera space)
+ *   Records are recognised by their colour: a bit-exact copy of a b1 light
+ *   colour. The same goes for every other buffer the engine copies the
+ *   light colour into (a 784-byte cbuffer, per-terrain-patch sun records).
  *
  * b0 = __shared_f3d_globals (per object). For every star effect:
  *   gObjectToClipMatrix         float4[4]   c4..c7 (rows)
@@ -89,7 +91,15 @@ constexpr uint64_t kAtmosphereLightColour = 416;  // float4
 }  // namespace gvd
 namespace light_list {
 constexpr uint64_t kScanMax = 8ull << 20;  // diagnostic scan: buffers up to 8 MB
-constexpr uint64_t kAutoMax = 4096;        // continuous patching: small buffers
+constexpr uint64_t kAutoMax = 4096;        // continuous patching: small buffers, every write
+// Larger buffers are patched on every write once their kind (size, usage) is
+// known to hold light colours. Atmospheric planets keep per-terrain-patch sun
+// records (direction, colour, ...) in ~320 KB structured buffers, found by a
+// scan. To find them without the manual scan, every kDiscoveryPeriod frames
+// up to kDiscoveryBytes of unknown mid-size buffer writes are searched too.
+constexpr uint64_t kHotMax = 1ull << 20;
+constexpr uint64_t kDiscoveryBytes = 1ull << 20;
+constexpr uint64_t kDiscoveryPeriod = 30;
 }  // namespace light_list
 constexpr uint64_t kSharedObjectToClip = 64;    // b0 c4..c7
 constexpr uint64_t kSmallBufferMax = 1024;      // b0/b2 are copied whole
@@ -213,6 +223,7 @@ struct LightState {
   std::string cls;
   float match_cos = 0.f;
   uint32_t frames_since_match = 0;
+  uint32_t frames_inactive = 0;
 };
 
 struct FrameMatch {
@@ -227,8 +238,30 @@ inline std::unordered_map<uint64_t, BufferShadow> shadows;
 inline std::unordered_map<uint64_t, Bindings> bindings;  // per command list
 inline std::array<LightState, 2> lights;
 inline std::array<FrameMatch, 2> frame_match;
+
+// Many render passes upload their own GlobalViewData every frame (about 200
+// uploads per frame in-game), and on atmospheric worlds some of them (sky and
+// scattering passes) carry a dimmed or zeroed copy of the star light. "Last
+// upload wins" therefore flickered: whichever pass happened to upload last
+// decided whether the light looked on or off and which colour the deferred
+// light list had to match. Instead, latest_gvd follows the brightest upload
+// of the current frame, and copies are matched against every colour variant
+// seen this frame and the previous one.
 inline GvdFields latest_gvd{};
 inline bool latest_gvd_valid = false;
+inline float frame_gvd_luma = -1.f;  // light luma of latest_gvd within this frame
+inline uint32_t frame_gvd_uploads = 0;
+
+struct ColourKey {
+  uint32_t w[3];  // float bits of an original light colour
+  bool operator==(const ColourKey& o) const { return w[0] == o.w[0] && w[1] == o.w[1] && w[2] == o.w[2]; }
+};
+constexpr size_t kMaxKeysPerLight = 16;
+inline std::array<std::vector<ColourKey>, 2> frame_keys, prev_keys;  // per light
+inline uint32_t stat_gvd_per_frame = 0, stat_variants[2] = {0, 0};
+// A light that goes dark (night side, eclipse, hangar) keeps its identity as
+// long as its direction stays continuous; forgotten only after this long.
+constexpr uint32_t kForgetAfterFrames = 1800;
 
 inline std::map<std::string, Rgb> colour_table;       // class -> colour
 inline std::map<std::string, std::string> learned;    // signature -> class
@@ -246,6 +279,7 @@ struct AnyBuffer {
 };
 inline std::unordered_map<uint64_t, AnyBuffer> any_buffers;
 inline std::set<std::pair<uint64_t, uint32_t>> hot_kinds;  // (size, usage) known to hold light records
+inline uint64_t discovery_budget = 0;                      // bytes of unknown mid-size buffers to search this frame
 inline int scan_frames_left = 0;
 inline uint32_t scan_hits_logged = 0, scan_buffers = 0;
 inline uint64_t scan_bytes = 0;
@@ -359,10 +393,28 @@ inline void OnGvdData(BufferShadow& sh, uint8_t* base) {
     return;
   }
   ++stat_gvd_uploads;
+  ++frame_gvd_uploads;
   sh.gvd = g;
   sh.gvd_valid = true;
-  latest_gvd = g;
-  latest_gvd_valid = true;
+
+  // brightest upload of the frame defines the lights (see latest_gvd)
+  float luma = 0.f;
+  for (int i = 0; i < 2; ++i) {
+    Rgb c{g.colour[i][0], g.colour[i][1], g.colour[i][2]};
+    const float y = Luma(c);
+    luma += y;
+    if (y > 0.f) {
+      ColourKey key;
+      std::memcpy(key.w, g.colour[i], sizeof(key.w));
+      auto& keys = frame_keys[i];
+      if (keys.size() < kMaxKeysPerLight && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
+    }
+  }
+  if (!latest_gvd_valid || luma > frame_gvd_luma) {
+    latest_gvd = g;
+    latest_gvd_valid = true;
+    frame_gvd_luma = luma;
+  }
 
   if (config.mode == 0.f) return;
   for (int i = 0; i < 2; ++i) {
@@ -420,36 +472,55 @@ inline void LogScanHit(char type, int light, uint64_t handle, const AnyBuffer& i
 // space)} and a 784-byte constant buffer holds colour@640, dir@672), so a
 // bit-exact match against b1's original colour is a precise signature.
 // state_mutex held. Returns true when data changed.
+// Which buffer writes are searched (state_mutex held). Diagnostic scan: all up
+// to kScanMax; otherwise small ones always, known kinds always, and a little
+// discovery budget for the rest.
+inline bool WantScan(const AnyBuffer& b) {
+  if (scan_frames_left > 0) return b.size <= light_list::kScanMax;
+  if (b.size <= light_list::kAutoMax) return true;
+  if (b.size > light_list::kHotMax) return false;
+  if (hot_kinds.contains({b.size, b.usage})) return true;
+  return discovery_budget >= b.size;
+}
+
 inline bool ScanBuffer(uint64_t handle, const AnyBuffer& info, uint8_t* base, uint64_t size, const char* path) {
-  if (!latest_gvd_valid || size < 12) return false;
+  if (!latest_gvd_valid || size < 12 || size > light_list::kScanMax) return false;
+  if (!WantScan(info)) return false;
   const bool scanning = scan_frames_left > 0;
-  if (!scanning && size > light_list::kAutoMax) return false;
-  if (size > light_list::kScanMax) return false;
   if (scanning) {
     ++scan_buffers;
     scan_bytes += size;
+  } else if (info.size > light_list::kAutoMax && !hot_kinds.contains({info.size, info.usage})) {
+    discovery_budget -= std::min(discovery_budget, info.size);
   }
   const GvdFields& g = latest_gvd;
-  uint32_t key[2][3];
-  bool key_ok[2];
+  // Every original colour of each light seen this frame or the previous one.
+  // Patching a copy only does something once the light's star is known.
+  std::array<std::vector<ColourKey>, 2> keys;
+  bool any_key = false;
   for (int i = 0; i < 2; ++i) {
-    std::memcpy(key[i], g.colour[i], sizeof(key[i]));
-    key_ok[i] = lights[i].active && Luma({g.colour[i][0], g.colour[i][1], g.colour[i][2]}) > 0.f;
+    if (!lights[i].known && !scanning) continue;
+    keys[i] = frame_keys[i];
+    for (const auto& k : prev_keys[i])
+      if (std::find(keys[i].begin(), keys[i].end(), k) == keys[i].end()) keys[i].push_back(k);
+    any_key = any_key || !keys[i].empty();
   }
-  if (!key_ok[0] && !key_ok[1] && !scanning) return false;
+  if (!any_key) return false;
 
   std::vector<uint8_t> local(base, base + size);  // one sequential read of (possibly write-combined) memory
   bool changed = false;
   for (uint64_t off = 0; off + 12 <= size; off += 4) {
-    uint32_t w[3];
-    std::memcpy(w, local.data() + off, sizeof(w));
+    ColourKey w;
+    std::memcpy(w.w, local.data() + off, sizeof(w.w));
     for (int i = 0; i < 2; ++i) {
-      if (!key_ok[i] || w[0] != key[i][0] || w[1] != key[i][1] || w[2] != key[i][2]) continue;
+      if (std::find(keys[i].begin(), keys[i].end(), w) == keys[i].end()) continue;
       if (scanning) LogScanHit('C', i, handle, info, path, off, local.data(), size);
       hot_kinds.insert({info.size, info.usage});
       ++stat_list_matched_frame;
       if (config.mode == 0.f) break;
-      Rgb out = RemapLight(lights[i], {g.colour[i][0], g.colour[i][1], g.colour[i][2]});
+      float orig[3];
+      std::memcpy(orig, w.w, sizeof(orig));
+      Rgb out = RemapLight(lights[i], {orig[0], orig[1], orig[2]});
       float v[3] = {out.r, out.g, out.b};
       std::memcpy(base + off, v, sizeof(v));
       ++stat_list_patched;
@@ -567,12 +638,14 @@ inline void EndFrame() {
     if (active) {
       const float* d = latest_gvd.dir[i];
       const float dot = l.dir[0] * d[0] + l.dir[1] * d[1] + l.dir[2] * d[2];
-      // a sudden jump in direction = a different star (jump, binary swap)
-      if (l.active && dot < std::cos(3.f * 3.14159265f / 180.f) && !frame_match[i].any) l.known = false;
+      // a sudden jump in direction = a different star (jump, binary swap);
+      // also checked when the light comes back after being dark
+      if (l.known && dot < std::cos(3.f * 3.14159265f / 180.f) && !frame_match[i].any) l.known = false;
       std::memcpy(l.dir, d, sizeof(l.dir));
       l.game_colour = {latest_gvd.colour[i][0], latest_gvd.colour[i][1], latest_gvd.colour[i][2]};
-    } else {
-      l.known = false;
+      l.frames_inactive = 0;
+    } else if (++l.frames_inactive > kForgetAfterFrames) {
+      l.known = false;  // dark for long: whatever lights up next is treated as new
     }
     l.active = active;
 
@@ -620,16 +693,25 @@ inline void EndFrame() {
     for (int i = 0; i < 2; ++i) {
       const auto& l = lights[i];
       s << " | L" << i << (l.active ? "" : " off") << " dir=(" << l.dir[0] << "," << l.dir[1] << "," << l.dir[2] << ")"
-        << " col=(" << l.game_colour.r << "," << l.game_colour.g << "," << l.game_colour.b << ") best_cos=" << stat_best_cos[i];
+        << " col=(" << l.game_colour.r << "," << l.game_colour.g << "," << l.game_colour.b << ") best_cos=" << stat_best_cos[i]
+        << " variants=" << frame_keys[i].size();
+      if (!l.active) s << " dark=" << l.frames_inactive;
       if (l.known) s << " star=" << FxName(l.source) << " " << l.signature << " class=" << l.cls;
     }
-    s << " | colour copies: kinds=" << hot_kinds.size() << " patched=" << stat_list_patched
-      << " matched/frame=" << stat_list_matched_frame;
+    s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
+      << " patched=" << stat_list_patched << " matched/frame=" << stat_list_matched_frame;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
 
   frame_match = {};
   stat_list_matched_frame = 0;
+  stat_gvd_per_frame = frame_gvd_uploads;
+  for (int i = 0; i < 2; ++i) stat_variants[i] = static_cast<uint32_t>(frame_keys[i].size());
+  prev_keys = std::move(frame_keys);
+  for (auto& k : frame_keys) k.clear();
+  frame_gvd_uploads = 0;
+  frame_gvd_luma = -1.f;  // next frame picks its own brightest upload
+  discovery_budget = (frame_index % light_list::kDiscoveryPeriod == 0) ? light_list::kDiscoveryBytes : 0;
 
   if (scan_frames_left > 0 && --scan_frames_left == 0) {
     std::stringstream s;
@@ -745,8 +827,7 @@ inline void OnMapBufferRegion(reshade::api::device*, reshade::api::resource reso
   auto it = shadows.find(resource.handle);
   if (it != shadows.end()) it->second.mapped = static_cast<uint8_t*>(*data);
   auto ab = any_buffers.find(resource.handle);
-  if (ab != any_buffers.end() && latest_gvd_valid
-      && (scan_frames_left > 0 || ab->second.size <= light_list::kAutoMax)) {
+  if (ab != any_buffers.end() && latest_gvd_valid && WantScan(ab->second)) {
     ab->second.mapped = static_cast<uint8_t*>(*data);
   }
 }
@@ -970,6 +1051,8 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
             }
             ImGui::Text("Light colour copies: %zu buffer kinds, %u patched%s",
                         hot_kinds.size(), stat_list_patched, scan_frames_left > 0 ? "  [scanning]" : "");
+            ImGui::Text("GlobalViewData per frame: %u uploads, colour variants %u / %u",
+                        stat_gvd_per_frame, stat_variants[0], stat_variants[1]);
             ImGui::Text("Learned signatures: %zu", learned.size());
             return false;
           },
