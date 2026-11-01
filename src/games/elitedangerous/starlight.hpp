@@ -1530,15 +1530,19 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .parse = [](float v) { return v * 0.01f; },
       },
       new Setting{
-          .key = "StarlightSaturation",
+          // 100 on the slider is a chroma multiplier of 0.7: the raw star
+          // colours are more saturated than looks natural in the lit scene,
+          // and 0.7 is where the owner and testers settled. New key so a
+          // value saved by an older build (percent of 1.0) is not reused.
+          .key = "StarlightChroma",
           .binding = &config.saturation,
           .default_value = 100.f,
           .label = "Saturation",
           .section = "Starlight",
-          .tooltip = "Chroma multiplier applied last (100 = unchanged)",
-          .max = 400.f,
+          .tooltip = "Chroma of the tint. 100 is the natural look; above it the colour gets heavy quickly.",
+          .max = 200.f,
           .is_enabled = [] { return config.mode != 0.f; },
-          .parse = [](float v) { return v * 0.01f; },
+          .parse = [](float v) { return v * 0.007f; },
       },
       new Setting{
           .key = "StarlightAutoLearn",
