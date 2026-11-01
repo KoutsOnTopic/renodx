@@ -253,6 +253,11 @@ struct FrameMatch {
   Rgb colour;      // what the star looks like (texture average when available)
   Rgb sig_colour;  // the b2 constant, stable per class: used for the signature
   float cos = -2.f;
+  // every draw kind that matched this light this frame, so a class learned
+  // from the surface can be attached to the corona/hotspot/flare signatures
+  std::array<bool, static_cast<size_t>(StarFx::Count)> fx_any{};
+  std::array<Rgb, static_cast<size_t>(StarFx::Count)> fx_sig{};
+  std::array<float, static_cast<size_t>(StarFx::Count)> fx_cos{};
 };
 
 // ---- rendered star colour ---------------------------------------------------
@@ -452,7 +457,12 @@ inline void SaveSignatures() {  // call with state_mutex held
 // 0.625,0.242 against a learned 0.624,0.242). Exact match first, otherwise
 // the nearest learned signature of the same draw kind within the tolerance,
 // which is far below the distance between classes.
-constexpr float kSignatureTolerance = 0.004f;
+constexpr float kSignatureTolerance = 0.012f;  // white dwarfs sit >= 0.018 from the Y band
+// Surface signatures of Y and T dwarfs form a flat band (g ~0.21, r 0.17..0.45)
+// clearly off the main-sequence ramp, and both look the same in game, so an
+// unlearned signature in that band counts as Y. L dwarfs lie on the ramp next
+// to late M stars and cannot be told apart this way.
+constexpr float kBrownDwarfBand[4] = {0.17f, 0.50f, 0.195f, 0.225f};  // r min, r max, g min, g max
 inline std::string LookupClass(const std::string& sig) {
   if (sig.empty()) return {};
   if (auto it = learned.find(sig); it != learned.end()) return it->second;
@@ -460,6 +470,9 @@ inline std::string LookupClass(const std::string& sig) {
   float r, g;
   if (colon == std::string::npos || std::sscanf(sig.c_str() + colon + 1, "%f,%f", &r, &g) != 2) return {};
   std::string best;
+  if (sig.compare(0, colon, "Surface") == 0 && r >= kBrownDwarfBand[0] && r <= kBrownDwarfBand[1]
+      && g >= kBrownDwarfBand[2] && g <= kBrownDwarfBand[3])
+    best = "Y";
   float best_d = kSignatureTolerance;
   for (const auto& [k, v] : learned) {
     if (k.size() <= colon || k.compare(0, colon + 1, sig, 0, colon + 1) != 0) continue;
@@ -1098,7 +1111,12 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
         if (c < threshold) continue;
         FrameMatch& fm = frame_match[i];
         const bool better = !fm.any || FxRank(star.fx) < FxRank(fm.fx) || (FxRank(star.fx) == FxRank(fm.fx) && c > fm.cos);
-        if (better) fm = {true, star.fx, seen, sig, c};
+        if (better) {
+          fm.any = true, fm.fx = star.fx, fm.colour = seen, fm.sig_colour = sig, fm.cos = c;
+        }
+        if (const auto k = static_cast<size_t>(star.fx); !fm.fx_any[k] || c > fm.fx_cos[k]) {
+          fm.fx_any[k] = true, fm.fx_sig[k] = sig, fm.fx_cos[k] = c;
+        }
         // The surface draw tells where the star is on screen and which target
         // it is drawn into: sample the rendered colour there at present.
         if (star.fx == StarFx::Surface && sc[3] > 0.f && bit->second.rt0.handle != 0u) {
@@ -1114,6 +1132,16 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
 }
 
 // ---- per frame -------------------------------------------------------------
+constexpr uint32_t kIdentityHold = 300;  // frames a better-ranked identity outranks a worse-ranked match
+
+inline void ResetMeasurement(LightState& l) {
+  l.measured_valid = false;
+  l.measured_samples = l.measured_used = 0;
+  l.measured_peak = 0.f;
+  l.measured_acc = {};
+  l.ring_count = l.ring_pos = 0;
+}
+
 inline void EndFrame() {
   StateLock lock;
   ++frame_index;
@@ -1123,12 +1151,14 @@ inline void EndFrame() {
     LightState& l = lights[i];
     const bool active = latest_gvd_valid
                         && Luma({latest_gvd.colour[i][0], latest_gvd.colour[i][1], latest_gvd.colour[i][2]}) > 0.f;
+    bool jumped = false;
     if (active) {
       const float* d = latest_gvd.dir[i];
       const float dot = l.dir[0] * d[0] + l.dir[1] * d[1] + l.dir[2] * d[2];
       // a sudden jump in direction = a different star (jump, binary swap);
       // also checked when the light comes back after being dark
-      if (l.known && dot < std::cos(3.f * 3.14159265f / 180.f) && !frame_match[i].any) l.known = false;
+      jumped = l.known && dot < std::cos(3.f * 3.14159265f / 180.f);
+      if (jumped && !frame_match[i].any) l.known = false;
       std::memcpy(l.dir, d, sizeof(l.dir));
       l.game_colour = {latest_gvd.colour[i][0], latest_gvd.colour[i][1], latest_gvd.colour[i][2]};
       l.frames_inactive = 0;
@@ -1137,36 +1167,39 @@ inline void EndFrame() {
     }
     l.active = active;
 
-    if (!l.known) {
-      l.measured_valid = false;  // a new star: measure afresh
-      l.measured_samples = 0;
-      l.measured_peak = 0.f;
-      l.measured_acc = {};
-      l.ring_count = l.ring_pos = l.measured_used = 0;
-    }
+    if (!l.known) ResetMeasurement(l);  // a new star: measure afresh
     const FrameMatch& fm = frame_match[i];
     if (fm.any) {
       const std::string sig = SignatureKey(fm.fx, fm.sig_colour);
-      if (l.known && sig != l.signature) {
-        l.measured_valid = false;
-        l.measured_samples = 0;
-        l.measured_peak = 0.f;
-        l.measured_acc = {};
-        l.ring_count = l.ring_pos = l.measured_used = 0;
-      l.ring_count = l.ring_pos = l.measured_used = 0;
-      l.measured_acc = {};
-      l.ring_count = l.ring_pos = l.measured_used = 0;
-      l.measured_peak = 0.f;
-      l.measured_acc = {};
-      l.ring_count = l.ring_pos = l.measured_used = 0;
+      // A worse-ranked draw (the corona billboard while the surface is briefly
+      // unmatched) must not replace a better identity of the same star: its
+      // signature has no learned class and the light would snap to the
+      // corona's constant. It may only take over after a direction jump or
+      // once the better source has been silent for a while.
+      const bool keep_current = l.known && !jumped && FxRank(fm.fx) > FxRank(l.source)
+                                && l.frames_since_match < kIdentityHold;
+      if (!keep_current) {
+        if (l.known && sig != l.signature) ResetMeasurement(l);
+        l.known = true;
+        l.source = fm.fx;
+        l.star_colour = fm.colour;
+        l.match_cos = fm.cos;
+        l.frames_since_match = 0;
+        l.signature = sig;
+        l.cls = LookupClass(l.signature);
       }
-      l.known = true;
-      l.source = fm.fx;
-      l.star_colour = fm.colour;
-      l.match_cos = fm.cos;
-      l.frames_since_match = 0;
-      l.signature = sig;
-      l.cls = LookupClass(l.signature);
+      // propagate a known class to the other draw kinds seen for this star
+      if (l.known && !l.cls.empty()) {
+        for (size_t k = 0; k < fm.fx_any.size(); ++k) {
+          if (!fm.fx_any[k]) continue;
+          const std::string other = SignatureKey(static_cast<StarFx>(k), fm.fx_sig[k]);
+          if (other.empty() || LookupClass(other) == l.cls) continue;
+          learned[other] = l.cls;
+          learned_changed = true;
+          std::string msg = "starlight: learned " + other + " = " + l.cls + " (from " + l.signature + ")";
+          reshade::log::message(reshade::log::level::info, msg.c_str());
+        }
+      }
     } else {
       ++l.frames_since_match;
     }
