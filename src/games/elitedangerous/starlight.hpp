@@ -155,7 +155,7 @@ inline const std::unordered_map<uint32_t, StarShader> kStarShaders = {
 
 // ---- settings --------------------------------------------------------------
 struct Config {
-  float mode = 2.f;  // 0 vanilla, 1 saturation, 2 star colour, 3 class table
+  float mode = 1.f;  // 0 vanilla, 1 star colour, 2 class table
   float strength = 1.f;
   float saturation = 1.f;
   float match_degrees = 0.75f;
@@ -439,8 +439,8 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   const Rgb* target = nullptr;
   Rgb star;
   if (l.known) {
-    if (config.mode == 3.f) target = LookupClassColour(l.cls);
-    if (target == nullptr && config.mode >= 2.f) {
+    if (config.mode == 2.f) target = LookupClassColour(l.cls);
+    if (target == nullptr) {
       star = l.measured_valid ? l.measured_acc : l.star_colour;  // measured when the star has been seen
       target = &star;
     }
@@ -1378,16 +1378,15 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
   using renodx::utils::settings::SettingValueType;
   return {
       new Setting{
-          .key = "StarlightMode",
+          .key = "StarlightColour",  // renamed when the Saturation mode was dropped, so stored values do not shift
           .binding = &config.mode,
           .value_type = SettingValueType::INTEGER,
-          .default_value = 2.f,
+          .default_value = 1.f,
           .label = "Starlight Colour",
           .section = "Starlight",
-          .tooltip = "Saturation: boost the game's own tint.\n"
-                     "Star Colour: tint each light with the colour of the star actually casting it.\n"
+          .tooltip = "Star Colour: tint each light with the colour of the star actually casting it.\n"
                      "Class Table: use renodx-starlight.ini for stars whose class has been learned.",
-          .labels = {"Vanilla", "Saturation", "Star Colour", "Class Table"},
+          .labels = {"Vanilla", "Star Colour", "Class Table"},
       },
       new Setting{
           .key = "StarlightStrength",
@@ -1396,7 +1395,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .label = "Strength",
           .section = "Starlight",
           .max = 100.f,
-          .is_enabled = [] { return config.mode >= 2.f; },
+          .is_enabled = [] { return config.mode != 0.f; },
           .parse = [](float v) { return v * 0.01f; },
       },
       new Setting{
