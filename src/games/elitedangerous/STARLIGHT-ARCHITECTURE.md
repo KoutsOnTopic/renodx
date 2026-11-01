@@ -112,6 +112,13 @@ prefix fallback would otherwise give T Tauri stars the T policy. Unlearned
 stars get the default. A heuristic that compared hues of measured vs
 constant was tried and removed: explicit per-class rules are predictable.
 
+**The Y/T band beats the journal label** (`PolicyClass`): a star whose
+surface signature lies in the band gets the Y policy even if the journal
+called it something else (except T, which keeps its own). Reason: the game
+draws some cold T Tauri stars exactly like Y dwarfs (Synuefe EL-E a66-2, a
+TTS at 450 K, surface 0.217,0.209), the teacher labelled it TTS, and the TTS
+policy gave the blue constant. The label is still stored and shown.
+
 Class Table mode uses the ini colour for the class; `table` as a policy
 uses it inside Star Colour mode; `measured` falls back to the class-table
 colour until the first sample exists (so a Y dwarf starts purple, not blue).

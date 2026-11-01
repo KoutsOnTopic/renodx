@@ -476,6 +476,13 @@ constexpr float kSignatureTolerance = 0.012f;  // white dwarfs sit >= 0.018 from
 // unlearned signature in that band counts as Y. L dwarfs lie on the ramp next
 // to late M stars and cannot be told apart this way.
 constexpr float kBrownDwarfBand[4] = {0.17f, 0.50f, 0.195f, 0.225f};  // r min, r max, g min, g max
+inline bool InBrownDwarfBand(const std::string& sig) {
+  const auto colon = sig.find(':');
+  float r, g;
+  return colon != std::string::npos && sig.compare(0, colon, "Surface") == 0
+         && std::sscanf(sig.c_str() + colon + 1, "%f,%f", &r, &g) == 2 && r >= kBrownDwarfBand[0]
+         && r <= kBrownDwarfBand[1] && g >= kBrownDwarfBand[2] && g <= kBrownDwarfBand[3];
+}
 inline std::string LookupClass(const std::string& sig) {
   if (sig.empty()) return {};
   if (auto it = learned.find(sig); it != learned.end()) return it->second;
@@ -483,9 +490,7 @@ inline std::string LookupClass(const std::string& sig) {
   float r, g;
   if (colon == std::string::npos || std::sscanf(sig.c_str() + colon + 1, "%f,%f", &r, &g) != 2) return {};
   std::string best;
-  if (sig.compare(0, colon, "Surface") == 0 && r >= kBrownDwarfBand[0] && r <= kBrownDwarfBand[1]
-      && g >= kBrownDwarfBand[2] && g <= kBrownDwarfBand[3])
-    best = "Y";
+  if (InBrownDwarfBand(sig)) best = "Y";
   float best_d = kSignatureTolerance;
   for (const auto& [k, v] : learned) {
     if (k.size() <= colon || k.compare(0, colon + 1, sig, 0, colon + 1) != 0) continue;
@@ -495,6 +500,15 @@ inline std::string LookupClass(const std::string& sig) {
     if (d <= best_d) best_d = d, best = v;
   }
   return best;
+}
+
+// The class whose policy, saturation and table colour apply. A star in the
+// Y/T band gets the Y policy even when the journal labelled it otherwise: the
+// game draws some cold T Tauri stars exactly like Y dwarfs (Synuefe EL-E
+// a66-2, TTS at 450 K, surface 0.217,0.209, magenta disc and light), and the
+// TTS policy would give it its blue constant. The label is kept for display.
+inline std::string PolicyClass(const LightState& l) {
+  return l.cls != "T" && InBrownDwarfBand(l.signature) ? std::string("Y") : l.cls;
 }
 
 inline const Rgb* LookupClassColour(const std::string& cls) {
@@ -555,14 +569,15 @@ inline float LookupClassSaturation(const std::string& cls) {
 //   vanilla   leave the game's light alone
 // Returns nullptr when the light is to be left as the game made it.
 inline const Rgb* StarColourFor(const LightState& l, Rgb& out, StarSource* used = nullptr) {
-  StarSource src = LookupPolicy(l.cls);
+  const std::string cls = PolicyClass(l);
+  StarSource src = LookupPolicy(cls);
   // not sampled yet: the class's table colour is a better stand-in than the constant
   if (src == StarSource::Measured && !(l.measured_valid && Luma(l.measured_acc) > 0.f)) src = StarSource::Table;
-  if (src == StarSource::Table && LookupClassColour(l.cls) == nullptr) src = StarSource::Constant;
+  if (src == StarSource::Table && LookupClassColour(cls) == nullptr) src = StarSource::Constant;
   if (used != nullptr) *used = src;
   switch (src) {
     case StarSource::Measured: out = l.measured_acc; return &out;
-    case StarSource::Table: out = *LookupClassColour(l.cls); return &out;
+    case StarSource::Table: out = *LookupClassColour(cls); return &out;
     case StarSource::Vanilla: return nullptr;
     default: out = l.star_colour; return &out;
   }
@@ -572,7 +587,7 @@ inline const Rgb* StarColourFor(const LightState& l, Rgb& out, StarSource* used 
 // the game's light alone".
 inline const Rgb* GoalColour(const LightState& l, Rgb& out) {
   const Rgb* target = nullptr;
-  if (config.mode == 2.f) target = LookupClassColour(l.cls);
+  if (config.mode == 2.f) target = LookupClassColour(PolicyClass(l));
   if (target == nullptr) target = StarColourFor(l, out);
   else out = *target, target = &out;
   return target;
@@ -600,7 +615,7 @@ inline void UpdateApplied(LightState& l, uint64_t arrival) {
   if (goal_ptr != nullptr && Luma(*goal_ptr) > 0.f) goal = Chromaticity(*goal_ptr);
   else if (l.base_valid && Luma(l.base_colour) > 0.f) goal = Chromaticity(l.base_colour);
   else return;
-  const float goal_sat = LookupClassSaturation(l.cls);
+  const float goal_sat = LookupClassSaturation(PolicyClass(l));
   const auto now = std::chrono::steady_clock::now();
 
   if (l.applied_valid && l.applied_identity != l.signature) {
@@ -647,7 +662,7 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
     class_sat = l.applied_sat;
   } else if (l.known) {
     target = GoalColour(l, star);
-    class_sat = LookupClassSaturation(l.cls);
+    class_sat = LookupClassSaturation(PolicyClass(l));
   }
   Rgb out = in;
   if (target != nullptr && Luma(*target) > 0.f) {
@@ -1323,6 +1338,7 @@ inline void EndFrame() {
         << " variants=" << frame_keys[i].size();
       if (!l.active) s << " dark=" << l.frames_inactive;
       if (l.known) s << " star=" << FxName(l.source) << " " << l.signature << " class=" << l.cls;
+      if (l.known && PolicyClass(l) != l.cls) s << " policy=" << PolicyClass(l) << " (Y/T band)";
     }
     s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
       << " patched=" << stat_list_patched << " matched/frame=" << stat_list_matched_frame;
@@ -1751,7 +1767,8 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                   if (l.rolling) ImGui::Text("   rolling over from the previous star");
                   const float su = used != nullptr ? used->r + used->g + used->b : 1.f;
                   ImGui::Text("   policy for class %s (saturation x%.2f): %s%s%.3f %.3f %.3f",
-                              l.cls.empty() ? "(unlearned)" : l.cls.c_str(), LookupClassSaturation(l.cls),
+                              PolicyClass(l).empty() ? "(unlearned)" : PolicyClass(l).c_str(),
+                              LookupClassSaturation(PolicyClass(l)),
                               src == StarSource::Measured ? "measured" : src == StarSource::Table ? "class table"
                               : src == StarSource::Vanilla ? "vanilla" : "constant",
                               used != nullptr ? ", using chroma " : " (light left as the game made it) ",
