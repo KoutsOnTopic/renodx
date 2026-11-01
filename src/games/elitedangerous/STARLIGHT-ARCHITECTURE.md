@@ -82,12 +82,19 @@ addon events at runtime.
   `renodx-starlight-signatures.ini`. Identification never uses the journal.
 - **Lookup tolerance** (`LookupClass`): exact, then nearest learned signature
   of the same kind within 0.012 on both channels. Reason: the same class
-  lands one rounding step away (0.625 vs 0.624). Classes are ≥ 0.03 apart on
-  a channel, white dwarfs ≥ 0.018 from the Y band.
+  lands one rounding step away (0.625 vs 0.624). Classes are NOT reliably
+  separated: the surface constant varies per star within a class (19 learned
+  M signatures), and learned pairs of different classes sit 0.009–0.018
+  apart (TTS/K, B/DA, A/F, B/A, Y/TTS). White dwarfs (DA 0.158, DC 0.157) sit
+  0.018 from the nearest learned Y but only 0.012 below the band's r minimum.
+  A leave-one-out test on the learned set gave the right class for about
+  60 % of signatures. In Star Colour mode only classes with their own policy
+  (Y, T, L) change the light, so most of these mix-ups are invisible.
 - **Y/T band:** unlearned surface signatures with r 0.17–0.50 and g
   0.195–0.225 count as Y. Reason: Y and T look identical in game and the band
-  is clearly off the main-sequence ramp. **L gets no band**: its constants
-  lie on the same ramp as late M stars (0.835,0.165 vs M 0.761,0.195).
+  is clearly off the main-sequence ramp. **L gets no band**: one learned L
+  lies on the extension of the K–M ramp (0.835,0.165 vs M 0.761,0.195), the
+  other well off it (0.624,0.242); two points do not define a band.
 - **Class propagation:** once a light has a class, the corona/hotspot/flare
   signatures matched in the same frame are learned with it. Reason: makes a
   corona-only match resolve next time without a journal event.
@@ -219,5 +226,15 @@ Debugging a crash: `cdb -z <dump>` from `%LOCALAPPDATA%\CrashDumps` with
   them or the buffer layouts breaks identification. Signs: GlobalViewData
   uploads rejected, no star matches, 0 patched copies. Re-run
   `ed_starlight_layout.py` and compare with the tables in the handoff.
+- A star too far away to be drawn as a body is never identified, so its
+  light stays vanilla. Seen at HIP 28711: about 11 minutes at the black hole
+  B, 156,000 ls from the O star A. The engine's `gLocalStarDirectionSize1..3`
+  (b1 bytes 1280–1312, lighting space, read by the skybox shaders) might
+  cover this; untested.
+- The System Map has its own directional light (seen as light 0 while the
+  map is open). It is correctly left unidentified.
+- For the first second after a jump, light 0's class can come from a
+  neighbouring signature (a TTS read as K once) because the journal is polled
+  once per second and the teacher fires after the first match.
 - Measurement needs the star in the main view; `measured` classes use the
   class-table colour until then.

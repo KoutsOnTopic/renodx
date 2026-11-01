@@ -469,8 +469,9 @@ inline void SaveSignatures() {  // call with state_mutex held
 // star of the same class can land one rounding step away (an L dwarf at
 // 0.625,0.242 against a learned 0.624,0.242). Exact match first, otherwise
 // the nearest learned signature of the same draw kind within the tolerance,
-// which is far below the distance between classes.
-constexpr float kSignatureTolerance = 0.012f;  // white dwarfs sit >= 0.018 from the Y band
+// which is below the distance between most classes (not all: see
+// STARLIGHT-ARCHITECTURE.md section 3).
+constexpr float kSignatureTolerance = 0.012f;  // learned white dwarfs: 0.018 from the nearest learned Y
 // Surface signatures of Y and T dwarfs form a flat band (g ~0.21, r 0.17..0.45)
 // clearly off the main-sequence ramp, and both look the same in game, so an
 // unlearned signature in that band counts as Y. L dwarfs lie on the ramp next
