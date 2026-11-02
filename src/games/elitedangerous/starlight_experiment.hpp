@@ -47,8 +47,9 @@
 // Data for statistics: while selected it appends one JSON object per line to
 // renodx-starlight-detection.jsonl next to the game executable: a "frame"
 // row per light every kSampleEvery frames with every method's verdict and
-// evidence (main_*, exp_*, R_*, slot_*, and m_* = every class method evaluated
-// on its own), plus "system" (the journal's star list whenever it changes),
+// evidence (main_*, exp_* including the tint applied, R_*, slot_*, and m_* =
+// every class method evaluated on its own), plus "system" (the journal's star
+// list whenever it changes),
 // "draw", "journal", "visit", "calib" and "session" rows.
 
 namespace elitedangerous::starlight::experiment {
@@ -549,6 +550,7 @@ inline void CopyKeepApplied(const LightState& m, LightState& v) {
   v.roll_from = keep.roll_from, v.roll_from_sat = keep.roll_from_sat, v.rolling = keep.rolling;
   v.roll_start = keep.roll_start, v.applied_identity = keep.applied_identity;
   v.applied_frame = keep.applied_frame, v.applied_arrival = keep.applied_arrival;
+  v.applied_time = keep.applied_time, v.holding = keep.holding;
 }
 
 // Every class method evaluated on its own for the default identity, without
@@ -607,6 +609,9 @@ inline void QueueFrameRow(int i, const LightState& m, const LightState& v, const
   const float s = m.game_colour.r + m.game_colour.g + m.game_colour.b;
   const float chroma[2] = {s > 0.f ? m.game_colour.r / s : 0.f, s > 0.f ? m.game_colour.g / s : 0.f};
   const FrameMatch& fm = frame_match[i];
+  // the tint this mode applies (chromaticity r,g; 0,0 = the game's own light)
+  const bool tinted = config.mode != 0.f && v.applied_valid && (v.known || v.holding);
+  const float applied[2] = {tinted ? v.applied.r : 0.f, tinted ? v.applied.g : 0.f};
   row.Int("light", i).Bool("active", m.active).Vec("dir", m.dir, 3).Vec("chroma", chroma, 2).Num("luma", Luma(m.game_colour))
       .Str("sys", journal.system.name).Int("addr", static_cast<int64_t>(journal.address)).Int("visit", static_cast<int64_t>(journal.visit))
       .Int("gui", journal.gui_focus).Int("flags", journal.flags).Bool("hyperspace", journal.hyperspace).Bool("paused", vd.paused)
@@ -618,6 +623,8 @@ inline void QueueFrameRow(int i, const LightState& m, const LightState& v, const
       // this mode
       .Bool("exp_known", v.known).Str("exp_cls", vd.cls).Str("exp_how", vd.how).Str("exp_body", vd.body)
       .Bool("exp_restored", vd.restored).Str("exp_policy", v.known ? PolicyClass(v) : "")
+      .Vec("exp_applied", applied, 2).Num("exp_applied_sat", tinted ? v.applied_sat : 0.f)
+      .Bool("exp_rolling", v.rolling).Bool("exp_holding", v.holding)
       // radius evidence
       .Num("R", ev.radius[i]).Str("R_kind", ev.radius[i] > 0.f ? FxName(ev.radius_kind[i]) : "").Num("R_dist", ev.radius_dist[i])
       .Str("R_best_body", ev.best_body[i]).Str("R_best_type", ev.best_type[i]).Bool("R_linked", ev.linked[i])

@@ -236,6 +236,22 @@ eases from old to new over `kRolloverSeconds` (2.5 s wall clock, smoothstep).
 Otherwise it switches at once, so arrivals have no delay. Reason: in-system
 hand-overs were jarring; jumps must not be.
 
+**Star lost for a moment: the tint is held.** A light whose identity drops
+keeps its applied tint for `kHoldSeconds` (0.5 s wall clock) in the same
+`arrival_seq` (`LightState::holding`): `RemapLight` keeps using `applied`,
+`ScanBuffer` keeps patching its copies, and a roll-over in progress pauses
+(`roll_start` is moved on by the gap when the same star returns). A different
+star found during the hold is a hand-over from the held tint. Reason: the game
+sometimes points a light between two stars for a few frames (HIP 21776, light 0
+8-32 degrees off the T dwarf towards the B, colour mixed to match; about 3
+frames in flight, up to about 0.37 s at System Map close). No star is drawn
+there, the identity dropped, and the light flashed the game's own colour
+(`Saturate(in, config.saturation)` on GlobalViewData, i.e. slider x 0.007,
+x0.595 at the owner's 85; raw on the ship/station copies),
+pale and near-neutral next to the tints. The owner saw it as a flicker. Side
+effect, the owner's choice: on opening the System Map its own light keeps the
+star's tint for up to 0.5 s.
+
 ## 8. Locking rule (crash lesson)
 
 `StateLock` wraps `state_mutex` and records per thread that it is held;
@@ -333,7 +349,9 @@ owner's working folder).
 - **Data file.** `renodx-starlight-detection.jsonl` next to the game, one
   JSON object per line: `frame` rows (each light every 30 frames: the
   default verdict, this mode's verdict and why, radius link, slot match,
-  journal context, and `m_*`: every class method evaluated on its own so
+  journal context, the tint applied (`exp_applied` chromaticity, 0,0 = the
+  game's own light; `exp_applied_sat`, `exp_rolling`, `exp_holding`), and
+  `m_*`: every class method evaluated on its own so
   methods can be compared, not only the winner), `system` rows (the
   journal's star list whenever it changes), `draw` rows (per draw kind,
   signature and radius once per visit), `journal`, `visit`, `calib` and

@@ -276,6 +276,10 @@ struct LightState {
   std::string applied_identity;  // signature the goal belongs to
   uint64_t applied_frame = 0;    // last frame the goal was computed
   uint64_t applied_arrival = 0;  // arrival_seq at that time
+  std::chrono::steady_clock::time_point applied_time{};  // and when (kHoldSeconds)
+  // Star lost a moment ago (kHoldSeconds): the tint above stays applied and a
+  // roll-over in progress is paused, not cancelled.
+  bool holding = false;
 };
 
 struct FrameMatch {
@@ -649,6 +653,15 @@ inline const Rgb* GoalColour(const LightState& l, Rgb& out) {
 
 constexpr float kRolloverSeconds = 2.5f;   // hand-over inside a system: roll the tint over this long
 constexpr uint64_t kHandoverGapFrames = 120;  // identified again within this: a hand-over, not an arrival
+// A light that loses its star keeps its tint this long. The game sometimes
+// points a light between two stars for a few frames (HIP 21776, 2 Nov: light 0
+// 8 to 32 degrees off the T dwarf towards the B, its colour mixed to match, for
+// about 3 frames in flight and up to about 0.37 s as the System Map closed). No
+// star is drawn there, so the identity drops, and the light flashed the game's
+// own colour, pale next to the tints. Wall clock, so the frame rate does not
+// matter. Side effect, chosen by the owner: on opening the System Map, the map's
+// own light keeps the star's tint for up to this long.
+constexpr std::chrono::duration<float> kHoldSeconds{0.5f};
 
 inline Rgb Chromaticity(const Rgb& c) {
   const float sum = c.r + c.g + c.b;
@@ -659,10 +672,18 @@ inline Rgb Chromaticity(const Rgb& c) {
 // applied tint towards it. A goal of "vanilla" is the light's own
 // chromaticity, so a class set to vanilla blends in and out like any other.
 inline void UpdateApplied(LightState& l, uint64_t arrival) {
+  const auto now = std::chrono::steady_clock::now();
   if (!l.known || config.mode == 0.f) {
-    l.rolling = false;
+    // star lost a moment ago in the same system: keep the tint (kHoldSeconds)
+    l.holding = config.mode != 0.f && l.applied_valid && arrival == l.applied_arrival
+                && now - l.applied_time < kHoldSeconds;
+    if (!l.holding) l.rolling = false;
     return;
   }
+  // bounded again here: the test mode's view is not updated while that mode is
+  // not selected, so a flag saved then may be minutes old when it comes back
+  const bool was_holding = l.holding && now - l.applied_time < kHoldSeconds;
+  l.holding = false;
   Rgb tmp;
   const Rgb* goal_ptr = GoalColour(l, tmp);
   Rgb goal;
@@ -670,12 +691,13 @@ inline void UpdateApplied(LightState& l, uint64_t arrival) {
   else if (l.base_valid && Luma(l.base_colour) > 0.f) goal = Chromaticity(l.base_colour);
   else return;
   const float goal_sat = LookupClassSaturation(PolicyClass(l));
-  const auto now = std::chrono::steady_clock::now();
 
   if (l.applied_valid && l.applied_identity != l.signature) {
     // another star: a hand-over if the previous one was applied a moment
-    // ago in the same system, otherwise (arrival after a jump) switch at once
-    const bool handover = frame_index - l.applied_frame < kHandoverGapFrames && arrival == l.applied_arrival;
+    // ago (or its tint is still held) in the same system, otherwise (arrival
+    // after a jump) switch at once
+    const bool handover = (was_holding || frame_index - l.applied_frame < kHandoverGapFrames)
+                          && arrival == l.applied_arrival;
     if (handover) {
       l.roll_from = l.applied;
       l.roll_from_sat = l.applied_sat;
@@ -684,11 +706,14 @@ inline void UpdateApplied(LightState& l, uint64_t arrival) {
     } else {
       l.rolling = false;
     }
+  } else if (was_holding && l.rolling) {
+    l.roll_start += now - l.applied_time;  // the same star back: resume the paused roll-over
   }
   if (!l.applied_valid) l.rolling = false;
   l.applied_identity = l.signature;
   l.applied_frame = frame_index;
   l.applied_arrival = arrival;
+  l.applied_time = now;
 
   float t = 1.f;
   if (l.rolling) {
@@ -711,8 +736,10 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   const Rgb* target = nullptr;
   Rgb star;
   float class_sat = 1.f;
-  if (l.known && l.applied_valid) {
-    target = &l.applied;  // the goal colour, rolled over on hand-overs (see UpdateApplied)
+  if ((l.known || l.holding) && l.applied_valid) {
+    // the goal colour, rolled over on hand-overs and held for a moment when
+    // the star is lost (see UpdateApplied)
+    target = &l.applied;
     class_sat = l.applied_sat;
   } else if (l.known) {
     target = GoalColour(l, star);
@@ -872,11 +899,13 @@ inline bool ScanBuffer(uint64_t handle, const AnyBuffer& info, uint8_t* base, ui
   }
   const GvdFields& g = latest_gvd;
   // Every original colour of each light seen this frame or the previous one.
-  // Patching a copy only does something once the light's star is known.
+  // Patching a copy only does something once the light's star is known (or
+  // its tint is held for a moment, kHoldSeconds).
   std::array<std::vector<ColourKey>, 2> keys;
   bool any_key = false;
   for (int i = 0; i < 2; ++i) {
-    if (!experiment::ActiveLight(i).known && !scanning) continue;
+    const LightState& al = experiment::ActiveLight(i);
+    if (!al.known && !al.holding && !scanning) continue;
     keys[i] = frame_keys[i];
     for (const auto& k : prev_keys[i])
       if (std::find(keys[i].begin(), keys[i].end(), k) == keys[i].end()) keys[i].push_back(k);
@@ -1445,6 +1474,7 @@ inline void EndFrame() {
         << " variants=" << frame_keys[i].size();
       if (!l.active) s << " dark=" << l.frames_inactive;
       if (l.known) s << " star=" << FxName(l.source) << " " << l.signature << " class=" << l.cls;
+      else if (l.holding) s << " holding tint";
       if (l.known && PolicyClass(l) != l.cls) s << " policy=" << PolicyClass(l) << (PolicyClass(l) == "L" ? " (L corona)" : " (Y/T band)");
     }
     s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
@@ -1904,6 +1934,8 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                 } else {
                   ImGui::TextUnformatted("   seen on screen: not measured yet (using the star's constant)");
                 }
+              } else if (l.holding) {
+                ImGui::TextUnformatted("   star lost for a moment: keeping its tint");
               } else {
                 ImGui::TextUnformatted("   star not identified yet (look towards it)");
               }
