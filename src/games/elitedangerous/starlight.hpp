@@ -517,7 +517,8 @@ inline bool InBrownDwarfBand(const std::string& sig) {
 }
 // The surface constant cannot tell L from late M (above), but the corona can:
 // the corona/edge/hotspot constants of every L dwarf seen are a deep red
-// (0.776,0.068 .. 1.000,0.000), every other star's have g >= 0.12, and T/Y
+// (0.776,0.068 .. 1.000,0.000), every other star's have g >= 0.12 except
+// the T Tauri stars the game draws like L dwarfs (see PolicyClass), and T/Y
 // dwarfs' have r <= 0.50.
 constexpr float kLDwarfCorona[2] = {0.70f, 0.09f};  // r min, g max
 inline bool IsLDwarfCorona(StarFx fx, const Rgb& c) {

@@ -37,9 +37,11 @@
 // light that loses its star (map opened, binary hand-over and back) gets it
 // back without waiting for a draw.
 //
-// Isolation: when the mode is not selected, none of this runs (every hook is
-// behind Selected()) and ActiveLight() returns the default light state, so
-// the default behaviour is unchanged. When selected, the default detection
+// Isolation: when the mode is not selected, this does nothing: every hook in
+// the frame path is behind Selected(), the thread started at load (Start)
+// only sleeps while the flag mirrored each frame (selected_flag) is off, and
+// ActiveLight() returns the default light state, so the default behaviour is
+// unchanged. When selected, the default detection
 // still runs every frame; this mode copies its result into `view`, overrides
 // the identity/class fields, and the colour pipeline (policies, saturation,
 // roll-over) is the same code fed with `view` instead of `lights`.

@@ -120,8 +120,9 @@ addon events at runtime.
   lies on the extension of the K–M ramp (0.835,0.165 vs M 0.761,0.195), the
   other well off it (0.624,0.242); two points do not define a band. Ten
   more L dwarfs since (subclass 0–8) spread their surfaces from 0.562,0.233
-  to 0.845,0.155, overlapping M and TTS. Their **corona** constants do
-  separate them (see `IsLDwarfCorona`, §4).
+  to 0.845,0.155, overlapping M and TTS. Their **corona** constants
+  separate them from every other class except the T Tauri stars the game
+  draws like L dwarfs, which are then lit as L (see `IsLDwarfCorona`, §4).
 - **Class propagation:** once a light has a class, the corona/hotspot/flare
   signatures matched in the same frame are learned with it. Reason: makes a
   corona-only match resolve next time without a journal event.
@@ -157,9 +158,10 @@ policy gave the blue constant. The label is still stored and shown.
 `IsLDwarfCorona`): a light labelled TTS whose star showed a corona, edge or
 hotspot constant with r ≥ 0.70 and g ≤ 0.09 gets the L policy. Data: every L
 dwarf corona seen lies at 0.776,0.068 … 1.000,0.000, every other star's has
-g ≥ 0.12, T/Y dwarfs' have r ≤ 0.50. Reason: the game draws some cool T Tauri
-stars like L dwarfs (Wredguia HV-H b39-0 B, TTS at 1629 K, corona
-0.892,0.041) and the TTS policy gave their orange constant. The flag
+g ≥ 0.12 except those T Tauri stars, T/Y dwarfs' have r ≤ 0.50. Reason:
+the game draws some cool T Tauri stars like L dwarfs (Wredguia HV-H
+b39-0 B, TTS at 1629 K, corona 0.892,0.041) and the TTS policy gave their
+orange constant. The flag
 (`LightState::l_corona`) is set from any draw kind matched to the light on a
 frame whose match became the identity (not when a worse-ranked draw was kept
 out: the identity's own draw is then unmatched and the corona may be another
@@ -313,8 +315,10 @@ draws** (sections 3–7). Built to find out which way of tying a light to its
 star is most reliable (research: `STARLIGHT-ATTRIBUTION-RESEARCH.md` in the
 owner's working folder).
 
-- **Isolation.** Every hook in `starlight.hpp` is behind
-  `experiment::Selected()`; the colour pipeline reads
+- **Isolation.** Every hook in `starlight.hpp`'s frame path is behind
+  `experiment::Selected()` (only `Start`/`Stop` at load and unload and the
+  per-frame copy of the flag, `selected_flag`, run always); the colour
+  pipeline reads
   `experiment::ActiveLight(i)`, which is `lights[i]` unless the mode is
   selected. Its journal thread idles until then. The default detection still
   runs every frame in test mode; the mode copies its result into `view` and
