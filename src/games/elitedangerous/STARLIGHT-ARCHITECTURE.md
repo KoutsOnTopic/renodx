@@ -70,6 +70,30 @@ addon events at runtime.
   jump, binary hand-over), or after `kForgetAfterFrames` of darkness.
   Reason: on planet surfaces the star is often hidden, and the light must
   not revert.
+- **Expiry on arrival** (top of `EndFrame`): when `arrival_seq` changes
+  (FSDJump after a Hyperspace StartJump), a light whose last accepted match
+  (`LightState::last_match`) is older than half way between the StartJump
+  read (`jump_start_time`) and now is forgotten. Wall-clock time, not
+  frames: the frame rate can drop in the tunnel (alt-tabbed under a driver
+  background frame cap), which would pull a frame-count half way back into
+  the countdown. A gap under `kMinJumpSeconds` (10 s) between the two reads
+  means the reader stalled, so that check is skipped.
+  Reason: light 1 is often a fixed, dim, bluish fill light (dir
+  -0.30,0.94,-0.19) that never goes dark or moves, so neither rule above
+  ever fires. It lined up with Col 285 Sector BC-R b6-2's L primary while
+  the ship turned for the jump (0.7 s before StartJump) and stayed that L
+  dwarf, with the L ×2.4 boost, through 13 later systems. Why the half: in
+  35 measured jumps (18.0–18.2 s, one 29.7 s) the old system's stars were
+  last matched ≤ 5.0 s after StartJump (countdown), the tunnel draws no
+  stars, and the arrival star matched at the FSDJump line; the half-way
+  point (≥ 9 s) always falls in the tunnel. Each journal event is read up
+  to ~1 s late, well inside those margins. Light 0 normally loses its old
+  star by itself (dark in the tunnel); its arrival star is matched after
+  the half-way point and kept. Carrier jumps do not bump `arrival_seq`, so
+  they do not expire identities. With the test mode selected, the expired
+  star is also dropped from its memory (`experiment::Forget`): its journal
+  reader polls faster, so it may already have remembered the stale star in
+  the new visit and would restore it by direction.
 - **Preference between draw kinds** (`FxRank`): surface > hotspot > corona >
   flare > edge. The surface constant is the stable class signature. A
   worse-ranked kind cannot replace a better identity unless the direction

@@ -242,6 +242,9 @@ struct LightState {
   std::string signature;
   std::string cls;
   float match_cos = 0.f;
+  // when this identity was last matched (accepted, not kept out): the arrival
+  // expiry in EndFrame compares it with the jump's timing in seconds
+  std::chrono::steady_clock::time_point last_match{};
   // this star's corona/edge/hotspot constant is an L dwarf's (IsLDwarfCorona);
   // belongs to the identity, so it is cleared with it (ResetMeasurement)
   bool l_corona = false;
@@ -420,6 +423,15 @@ inline thread_local bool in_own_update = false;
 inline std::string arrival_class;
 inline uint64_t arrival_seq = 0, arrival_seq_used = 0;
 inline uint64_t arrival_frame = 0;
+// when the last hyperspace StartJump was read, and the arrival_seq the light
+// identities were last checked against (stale identities, top of EndFrame)
+inline std::chrono::steady_clock::time_point jump_start_time{};
+inline uint64_t identity_seq = 0;
+// StartJump to FSDJump is ~18 s (35 jumps measured, one 29.7 s). A shorter gap
+// between the two reads means the journal reader stalled and read StartJump
+// late, so half way would not lie in the tunnel: skip that check (the next
+// arrival catches a stale light; it cannot match in a tunnel either).
+constexpr std::chrono::seconds kMinJumpSeconds{10};
 inline std::atomic_bool journal_run = false;
 inline std::thread journal_thread;
 
@@ -1298,6 +1310,37 @@ inline void EndFrame() {
   ++frame_index;
   bool learned_changed = false;
 
+  // A hyperspace arrival: a light whose star was last matched before the
+  // tunnel still holds a star of the previous system. Light 0 drops it by
+  // itself (dark in the tunnel, new direction after), but a light that never
+  // goes dark and never moves kept it for good: light 1's dim fill light
+  // lined up with the L primary of Col 285 Sector BC-R b6-2 while the ship
+  // turned for the jump and stayed that L dwarf through 13 later systems.
+  // A jump is the countdown (~5 s, the old system still drawn, StartJump at
+  // its start), then the tunnel (~13 s, no star drawn), then FSDJump. Half
+  // way from StartJump to now lies in the tunnel, where nothing can match:
+  // a last match before it is the old system's (the fill light matched 0.7 s
+  // before StartJump), one after it is the arrival star's. Measured in
+  // seconds, not frames: the frame rate can drop in the tunnel (alt-tabbed
+  // under a background frame cap) and move a frame-count half way back into
+  // the countdown. Checked before this frame's matches, so a star seen this
+  // frame is identified again at once.
+  const auto now = std::chrono::steady_clock::now();
+  if (arrival_seq != identity_seq) {
+    identity_seq = arrival_seq;
+    const auto jump = now - jump_start_time;
+    if (jump >= kMinJumpSeconds) {
+      const auto half_way = jump_start_time + jump / 2;
+      for (auto& l : lights) {
+        if (!l.known || l.last_match >= half_way) continue;
+        // the test mode remembered it in the new visit (its journal reader
+        // sees FSDJump first) and would restore it by direction at once
+        if (experiment::Selected()) experiment::Forget(l.signature);
+        l.known = false;
+      }
+    }
+  }
+
   for (int i = 0; i < 2; ++i) {
     LightState& l = lights[i];
     const bool active = latest_gvd_valid
@@ -1336,6 +1379,7 @@ inline void EndFrame() {
         l.star_colour = fm.colour;
         l.match_cos = fm.cos;
         l.frames_since_match = 0;
+        l.last_match = now;
         l.signature = sig;
         l.cls = LookupClass(l.signature);
       }
@@ -1493,6 +1537,8 @@ inline void JournalLoop() {
         if (line.find("\"event\":\"StartJump\"") != std::string::npos
             && line.find("\"JumpType\":\"Hyperspace\"") != std::string::npos) {
           pending = JsonField(line, "StarClass");
+          StateLock lock;
+          jump_start_time = std::chrono::steady_clock::now();
         } else if (line.find("\"event\":\"FSDJump\"") != std::string::npos && !pending.empty()) {
           StateLock lock;
           arrival_class = pending;

@@ -431,6 +431,19 @@ inline void Remember(const LightState& m, const Verdict& vd) {
   r->l_corona = r->l_corona || m.l_corona;
 }
 
+// The default detection expired a light's identity on arrival (a star of the
+// previous system, see the top of EndFrame in starlight.hpp). This thread
+// polls the journal faster, so the new visit may already remember that star;
+// drop it, or Recall would restore it by direction at once.
+inline void Forget(const std::string& signature) {
+  std::erase_if(visit.memory, [&](const Remembered& r) { return r.signature == signature; });
+  visit.sig_class.erase(signature);  // else it counts as assigned (UnassignedClasses)
+  if (visit.arrival_sig == signature) {  // taken as the arrival star by mistake: let the real one claim it
+    visit.arrival_sig.clear();
+    visit.arrival_done = false;
+  }
+}
+
 // True if this remembered star is what the other light is showing now.
 inline bool HeldByOtherLight(const Remembered& e, int light) {
   const LightState& o = lights[1 - light];
