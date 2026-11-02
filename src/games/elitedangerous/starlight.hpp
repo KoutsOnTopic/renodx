@@ -161,6 +161,7 @@ struct Config {
   float match_degrees = 0.75f;
   float auto_learn = 1.f;
   float probe_log = 0.f;
+  float detection = 0.f;  // 0 star draws (default), 1 journal + engine (test mode, starlight_experiment.hpp)
 };
 inline Config config;
 
@@ -202,6 +203,16 @@ struct GvdFields {
   float body_pos[3];
 };
 
+// Extra GlobalViewData fields read only by the experimental detection
+// (starlight_experiment.hpp); filled only while it is selected.
+struct GvdExtra {
+  bool valid = false;
+  float local_star[3][4] = {};  // gLocalStarDirectionSize1..3
+  float local_info[4] = {};     // gLocalStarAdditionalInfo
+  float body_radius = 0.f;      // gStellarBodyRadius
+  float camera[3] = {};         // gCameraPos
+};
+
 struct BufferShadow {
   uint64_t size = 0;
   bool is_gvd = false;
@@ -209,6 +220,7 @@ struct BufferShadow {
   std::vector<uint8_t> bytes;  // whole contents for small buffers
   GvdFields gvd{};             // original (unpatched) fields for GlobalViewData
   bool gvd_valid = false;
+  GvdExtra extra{};            // experimental detection only
 };
 
 struct Bindings {
@@ -683,6 +695,14 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
   return Saturate(out, config.saturation * class_sat);
 }
 
+// ---- experimental detection (separate file, selectable) -----------------------
+// Defined further down (journal teacher); used by the experiment's journal thread.
+inline std::filesystem::path JournalDir();
+inline std::string JsonField(const std::string& line, const char* key);
+}  // namespace elitedangerous::starlight
+#include "./starlight_experiment.hpp"
+namespace elitedangerous::starlight {
+
 // ---- GlobalViewData upload -------------------------------------------------
 inline bool ReadGvd(const uint8_t* base, GvdFields& g) {
   std::memcpy(g.dir, base + gvd::kLightDir, sizeof(g.dir));
@@ -711,6 +731,7 @@ inline void OnGvdData(BufferShadow& sh, uint8_t* base) {
   ++frame_gvd_uploads;
   sh.gvd = g;
   sh.gvd_valid = true;
+  if (experiment::Selected()) experiment::OnGvd(sh, base, g);
 
   // brightest upload of the frame defines the lights (see latest_gvd)
   float luma = 0.f;
@@ -735,7 +756,7 @@ inline void OnGvdData(BufferShadow& sh, uint8_t* base) {
   for (int i = 0; i < 2; ++i) {
     Rgb in{g.colour[i][0], g.colour[i][1], g.colour[i][2]};
     if (!(Luma(in) > 0.f)) continue;
-    Rgb out = RemapLight(lights[i], in);
+    Rgb out = RemapLight(experiment::ActiveLight(i), in);
     float* dst = reinterpret_cast<float*>(base + gvd::kLightColour + 16 * i);
     float v[3] = {out.r, out.g, out.b};
     std::memcpy(dst, v, sizeof(v));
@@ -745,7 +766,7 @@ inline void OnGvdData(BufferShadow& sh, uint8_t* base) {
   std::memcpy(atmo, base + gvd::kAtmosphereLightColour, sizeof(atmo));
   Rgb a{atmo[0], atmo[1], atmo[2]};
   if (Finite(atmo, 3) && a.r >= 0 && a.g >= 0 && a.b >= 0 && Luma(a) > 0.f) {
-    Rgb out = RemapLight(lights[0], a);
+    Rgb out = RemapLight(experiment::ActiveLight(0), a);
     float v[3] = {out.r, out.g, out.b};
     std::memcpy(base + gvd::kAtmosphereLightColour, v, sizeof(v));
   }
@@ -814,7 +835,7 @@ inline bool ScanBuffer(uint64_t handle, const AnyBuffer& info, uint8_t* base, ui
   std::array<std::vector<ColourKey>, 2> keys;
   bool any_key = false;
   for (int i = 0; i < 2; ++i) {
-    if (!lights[i].known && !scanning) continue;
+    if (!experiment::ActiveLight(i).known && !scanning) continue;
     keys[i] = frame_keys[i];
     for (const auto& k : prev_keys[i])
       if (std::find(keys[i].begin(), keys[i].end(), k) == keys[i].end()) keys[i].push_back(k);
@@ -835,7 +856,7 @@ inline bool ScanBuffer(uint64_t handle, const AnyBuffer& info, uint8_t* base, ui
       if (config.mode == 0.f) break;
       float orig[3];
       std::memcpy(orig, w.w, sizeof(orig));
-      Rgb out = RemapLight(lights[i], {orig[0], orig[1], orig[2]});
+      Rgb out = RemapLight(experiment::ActiveLight(i), {orig[0], orig[1], orig[2]});
       float v[3] = {out.r, out.g, out.b};
       std::memcpy(base + off, v, sizeof(v));
       ++stat_list_patched;
@@ -1227,6 +1248,7 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
       }
     }
   }
+  if (experiment::Selected()) experiment::OnStarDraw(star.fx, sig, m, *b0, *b1);
   return true;
 }
 
@@ -1304,6 +1326,10 @@ inline void EndFrame() {
     }
   }
 
+  // test-mode detection (starlight_experiment.hpp) builds its own view of the
+  // lights from the result above; the default path below is unaffected
+  if (experiment::Selected()) experiment::EndFrame(arrival_seq);
+  experiment::selected_flag = experiment::Selected();
   for (auto& l : lights) UpdateApplied(l, arrival_seq);
 
   // Teacher: just after arriving, light 0 is the arrival star.
@@ -1366,6 +1392,9 @@ inline void EndFrame() {
       lights[i].base_valid = true;
     }
   }
+  if (experiment::Selected())  // test mode: its view uses this frame's unattenuated colour too
+    for (int i = 0; i < 2; ++i)
+      experiment::view[i].base_valid = lights[i].base_valid, experiment::view[i].base_colour = lights[i].base_colour;
   prev_keys = std::move(frame_keys);
   for (auto& k : frame_keys) k.clear();
   frame_gvd_uploads = 0;
@@ -1678,6 +1707,21 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .labels = {"Vanilla", "Star Colour", "Class Table"},
       },
       new Setting{
+          .key = "StarlightDetection",
+          .binding = &config.detection,
+          .value_type = SettingValueType::INTEGER,
+          .default_value = 0.f,
+          .label = "Detection",
+          .section = "Starlight",
+          .tooltip = "How a light is tied to its star.\n"
+                     "Star draws: the default.\n"
+                     "Journal + engine (test): adds the journal (arrival class, the system's stars after a\n"
+                     "discovery scan), the drawn star's radius and the engine's local star directions, and\n"
+                     "writes renodx-starlight-detection.jsonl next to the game for analysis.",
+          .labels = {"Star draws", "Journal + engine (test)"},
+          .is_enabled = [] { return config.mode != 0.f; },
+      },
+      new Setting{
           .key = "StarlightStrength",
           .binding = &config.strength,
           .default_value = 100.f,
@@ -1802,6 +1846,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                         stat_gvd_per_frame, stat_variants[0], stat_variants[1]);
             ImGui::Text("Learned signatures: %zu   star readbacks: %u (%u side-pass probes skipped)", learned.size(),
                         stat_readbacks, stat_probes_skipped);
+            if (experiment::Selected()) experiment::DrawOverlay();
             return false;
           },
       },
@@ -1829,6 +1874,7 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
       journal_run = true;
       journal_thread = std::thread(JournalLoop);
+      experiment::Start(dir);  // idles until the test-mode detection is selected
       break;
     }
     case DLL_PROCESS_DETACH:
@@ -1844,6 +1890,7 @@ inline void Use(DWORD fdw_reason) {
       reshade::unregister_event<reshade::addon_event::copy_resource>(OnCopyResource);
       journal_run = false;
       if (journal_thread.joinable()) journal_thread.detach();  // never block in DllMain
+      experiment::Stop();
       break;
   }
 }

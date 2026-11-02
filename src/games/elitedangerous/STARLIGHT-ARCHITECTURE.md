@@ -229,8 +229,10 @@ Debugging a crash: `cdb -z <dump>` from `%LOCALAPPDATA%\CrashDumps` with
 - A star too far away to be drawn as a body is never identified, so its
   light stays vanilla. Seen at HIP 28711: about 11 minutes at the black hole
   B, 156,000 ls from the O star A. The engine's `gLocalStarDirectionSize1..3`
-  (b1 bytes 1280–1312, lighting space, read by the skybox shaders) might
-  cover this; untested.
+  (b1 bytes 1280–1312, lighting space, read by the skybox shaders) do not
+  help: the test mode found them zero in every valid upload of a 35-jump
+  session (2 Nov 2026), including about 5 minutes under a dim, unnamed
+  light in HIP 28711.
 - The System Map has its own directional light (seen as light 0 while the
   map is open). It is correctly left unidentified.
 - For the first second after a jump, light 0's class can come from a
@@ -238,3 +240,58 @@ Debugging a crash: `cdb -z <dump>` from `%LOCALAPPDATA%\CrashDumps` with
   once per second and the teacher fires after the first match.
 - Measurement needs the star in the main view; `measured` classes use the
   class-table colour until then.
+
+## 11. Test-mode detection (`starlight_experiment.hpp`)
+
+Selected with **Detection = Journal + engine (test)**; the default is **Star
+draws** (sections 3–7). Built to find out which way of tying a light to its
+star is most reliable (research: `STARLIGHT-ATTRIBUTION-RESEARCH.md` in the
+owner's working folder).
+
+- **Isolation.** Every hook in `starlight.hpp` is behind
+  `experiment::Selected()`; the colour pipeline reads
+  `experiment::ActiveLight(i)`, which is `lights[i]` unless the mode is
+  selected. Its journal thread idles until then. The default detection still
+  runs every frame in test mode; the mode copies its result into `view` and
+  overrides identity and class there, so `lights`, learned signatures and
+  the signatures file are never changed by it.
+- **What it adds**, best evidence first when naming a star's class:
+  1. *Radius link.* Corona, edge and lens-flare draws carry
+     `gStellarBodyRadius` (b1 2016), the star's true radius; matched within
+     1 % to a journal Scan `Radius` of the current system (next best ≥ 2 %
+     worse), it names the body. Only after a discovery scan: before it the
+     list usually holds just the arrival star, so a similar-sized companion
+     would "match" it with nothing to rule it out. The unit is calibrated on arrival stars
+     (journal Radius / drawn radius, median).
+  2. *Arrival class.* The first light-0 identity within 600 frames of a
+     live hyperspace arrival gets the StartJump `StarClass` (the default's
+     teacher can lose a race with its 1 s journal poll).
+  3. *System list.* Only once a discovery scan listed the system's stars
+     (this visit or any earlier journal): classes are narrowed to the
+     system's luminous stars. Owner's rule: never in an unexplored system
+     before the honk, where the journal knows only the arrival star.
+  4. Otherwise the default lookup.
+- **Lights without a drawn star.** A light that loses its identity gets the
+  star remembered at the same direction (≤ 3°) this visit, if seen within
+  600 frames or confirmed by a local star slot. A light that matches a local
+  star slot (`gLocalStarDirectionSize1..3`, b1 1280–1312) but no remembered
+  star gets the class of a remembered star within 15° (it moved while
+  unidentified), otherwise the system's one unaccounted luminous star, if
+  the list is complete; colour from the class table. Memory lookups skip the
+  star the other light shows at that moment.
+- **Pauses.** No new identities while a map is open (Status.json `GuiFocus`
+  6–8) or during a hyperspace jump (StartJump to arrival; Status.json FSD
+  flags end it if the countdown is cancelled). The map and tunnel lights
+  have their own directions, so they stay unidentified.
+- **Data file.** `renodx-starlight-detection.jsonl` next to the game, one
+  JSON object per line: `frame` rows (each light every 30 frames: the
+  default verdict, this mode's verdict and why, radius link, slot match,
+  journal context, and `m_*`: every class method evaluated on its own so
+  methods can be compared, not only the winner), `system` rows (the
+  journal's star list whenever it changes), `draw` rows (per draw kind,
+  signature and radius once per visit), `journal`, `visit`, `calib` and
+  `session` rows. Integers (flags, SystemAddress) are written exactly. Capped at
+  256 MB. Rows are queued under the lock and written by the journal thread.
+- **Locking.** The journal thread takes `StateLock` only to publish parsed
+  state or swap the row queue; file reads and writes happen outside it, and
+  it makes no D3D calls (section 8).
