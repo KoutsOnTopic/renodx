@@ -216,10 +216,12 @@ colour until the first sample exists (so a Y dwarf starts purple, not blue).
   is known to hold light colours (`hot_kinds`), discovered by a 1 MB search
   budget every 30 frames or the manual scan. Reason: terrain sun records live
   in ~320 KB buffers; scanning every large write would cost frame time.
-- **Saturation:** `Saturate(out, slider × class)`; slider 100 = ×0.7, max 200,
-  because raw star colours are more saturated than looks natural and the
-  owner settled on 0.7. Setting key `StarlightChroma` (renamed so old
-  percentages are not reused). Modes: Vanilla / Star Colour / Class Table
+- **Saturation:** `Saturate(out, slider × class)`; slider 100 = ×0.5, max 200
+  (= ×1.0, the raw colour), because raw star colours are more saturated than
+  looks natural. The owner first settled on 0.7, then on 0.5 (G and K stars
+  look most accurate, far less colour clipping in SDR). Setting key
+  `StarlightTintChroma`, renamed on each rescale so old percentages are not
+  reused (`StarlightSaturation`, then `StarlightChroma`). Modes: Vanilla / Star Colour / Class Table
   (key `StarlightColour`; the old Saturation mode was removed as it only
   complicated A/B testing).
 - **Two light slots stay independent** (`lights[0]`, `lights[1]`, copies
@@ -246,8 +248,8 @@ sometimes points a light between two stars for a few frames (HIP 21776, light 0
 8-32 degrees off the T dwarf towards the B, colour mixed to match; about 3
 frames in flight, up to about 0.37 s at System Map close). No star is drawn
 there, the identity dropped, and the light flashed the game's own colour
-(`Saturate(in, config.saturation)` on GlobalViewData, i.e. slider x 0.007,
-x0.595 at the owner's 85; raw on the ship/station copies),
+(`Saturate(in, config.saturation)` on GlobalViewData, i.e. slider x 0.005,
+x0.5 at 100; raw on the ship/station copies),
 pale and near-neutral next to the tints. The owner saw it as a flicker. Side
 effect, the owner's choice: on opening the System Map its own light keeps the
 star's tint for up to 0.5 s.
