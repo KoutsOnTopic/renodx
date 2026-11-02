@@ -130,6 +130,7 @@ struct Remembered {
   std::string signature, cls, body;
   Rgb star_colour;
   StarFx source = StarFx::Count;
+  bool l_corona = false;  // LightState::l_corona, sticky per star like the default's
   uint64_t frame = 0;
 };
 struct Visit {
@@ -427,6 +428,7 @@ inline void Remember(const LightState& m, const Verdict& vd) {
   std::memcpy(r->dir, m.dir, sizeof(r->dir));
   r->signature = m.signature, r->cls = vd.cls, r->body = vd.body;
   r->star_colour = m.star_colour, r->source = m.source, r->frame = frame_index;
+  r->l_corona = r->l_corona || m.l_corona;
 }
 
 // True if this remembered star is what the other light is showing now.
@@ -505,7 +507,8 @@ inline void ResolveClass(int i, const LightState& m, Verdict& vd) {
 
 // Class for a light recognised only by a local star slot: the system's one
 // luminous star not yet tied to a drawn identity, if the list is complete.
-inline std::string SlotClass(const float dir[3], int light) {
+inline std::string SlotClass(const float dir[3], int light, bool* l_corona) {
+  *l_corona = false;
   if (!journal.system.discovery) return {};
   // a remembered star within 15 degrees most likely moved while unidentified:
   // it is that star, not the one class left over
@@ -517,7 +520,10 @@ inline std::string SlotClass(const float dir[3], int light) {
     const float d = e.dir[0] * dir[0] + e.dir[1] * dir[1] + e.dir[2] * dir[2];
     if (d >= best_dot) best_dot = d, nearest = &e;
   }
-  if (nearest != nullptr) return nearest->cls;
+  if (nearest != nullptr) {
+    *l_corona = nearest->l_corona;
+    return nearest->cls;
+  }
   auto left = UnassignedClasses("");
   return left.size() == 1 ? left.begin()->first : std::string{};
 }
@@ -646,11 +652,14 @@ inline void EndFrame(uint64_t arrival) {
       const bool may_recall = !paused || ev.slot_cos[i] >= threshold;  // map/tunnel lights are not stars
       if (const Remembered* r = may_recall ? Recall(m.dir, i) : nullptr; r != nullptr) {
         v.known = true, v.signature = r->signature, v.cls = r->cls, v.star_colour = r->star_colour, v.source = r->source;
+        v.l_corona = r->l_corona;
         vd.cls = r->cls, vd.body = r->body, vd.how = "remembered direction", vd.restored = true;
       } else if (!paused && ev.slot_cos[i] >= threshold) {
-        const std::string cls = SlotClass(m.dir, i);
+        bool l_corona = false;
+        const std::string cls = SlotClass(m.dir, i, &l_corona);
         if (!cls.empty()) {
           v.known = true, v.signature = "Slot:" + cls, v.cls = cls, v.source = StarFx::Count;
+          v.l_corona = l_corona;
           const Rgb* t = LookupClassColour(cls);
           v.star_colour = t != nullptr ? *t : Rgb{};
           vd.cls = cls, vd.how = "local star slot";

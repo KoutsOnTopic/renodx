@@ -94,7 +94,10 @@ addon events at runtime.
   0.195–0.225 count as Y. Reason: Y and T look identical in game and the band
   is clearly off the main-sequence ramp. **L gets no band**: one learned L
   lies on the extension of the K–M ramp (0.835,0.165 vs M 0.761,0.195), the
-  other well off it (0.624,0.242); two points do not define a band.
+  other well off it (0.624,0.242); two points do not define a band. Ten
+  more L dwarfs since (subclass 0–8) spread their surfaces from 0.562,0.233
+  to 0.845,0.155, overlapping M and TTS. Their **corona** constants do
+  separate them (see `IsLDwarfCorona`, §4).
 - **Class propagation:** once a light has a class, the corona/hotspot/flare
   signatures matched in the same frame are learned with it. Reason: makes a
   corona-only match resolve next time without a journal event.
@@ -125,6 +128,26 @@ called it something else (except T, which keeps its own). Reason: the game
 draws some cold T Tauri stars exactly like Y dwarfs (Synuefe EL-E a66-2, a
 TTS at 450 K, surface 0.217,0.209), the teacher labelled it TTS, and the TTS
 policy gave the blue constant. The label is still stored and shown.
+
+**An L dwarf's corona makes a T Tauri star an L** (`PolicyClass`,
+`IsLDwarfCorona`): a light labelled TTS whose star showed a corona, edge or
+hotspot constant with r ≥ 0.70 and g ≤ 0.09 gets the L policy. Data: every L
+dwarf corona seen lies at 0.776,0.068 … 1.000,0.000, every other star's has
+g ≥ 0.12, T/Y dwarfs' have r ≤ 0.50. Reason: the game draws some cool T Tauri
+stars like L dwarfs (Wredguia HV-H b39-0 B, TTS at 1629 K, corona
+0.892,0.041) and the TTS policy gave their orange constant. The flag
+(`LightState::l_corona`) is set from any draw kind matched to the light on a
+frame whose match became the identity (not when a worse-ranked draw was kept
+out: the identity's own draw is then unmatched and the corona may be another
+star's), and kept while its identity holds, because the corona is not matched
+every frame. The test mode's memory keeps it per remembered star.
+**Its light is not its own vanilla:** the game lights that star a bland
+magenta (0.416,0.255), nothing like an L dwarf, so where the L policy says
+`vanilla` it takes `kLDwarfGameLight` instead, the mean of the game's light
+at ten real L dwarfs (0.623,0.186). The L saturation applies on top, so it
+ends up like a real L dwarf. Side effect: an L dwarf misread as TTS by the
+nearest-signature match (Wredguia CZ-M b35-0 B, surface 0.710,0.248) is lit
+as L too.
 
 Class Table mode uses the ini colour for the class; `table` as a policy
 uses it inside Star Colour mode; `measured` falls back to the class-table

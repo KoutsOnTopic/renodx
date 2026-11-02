@@ -242,6 +242,9 @@ struct LightState {
   std::string signature;
   std::string cls;
   float match_cos = 0.f;
+  // this star's corona/edge/hotspot constant is an L dwarf's (IsLDwarfCorona);
+  // belongs to the identity, so it is cleared with it (ResetMeasurement)
+  bool l_corona = false;
   uint32_t frames_since_match = 0;
   uint32_t frames_inactive = 0;
   // measured from the rendered star (see StarProbe); reset with the identity
@@ -496,6 +499,16 @@ inline bool InBrownDwarfBand(const std::string& sig) {
          && std::sscanf(sig.c_str() + colon + 1, "%f,%f", &r, &g) == 2 && r >= kBrownDwarfBand[0]
          && r <= kBrownDwarfBand[1] && g >= kBrownDwarfBand[2] && g <= kBrownDwarfBand[3];
 }
+// The surface constant cannot tell L from late M (above), but the corona can:
+// the corona/edge/hotspot constants of every L dwarf seen are a deep red
+// (0.776,0.068 .. 1.000,0.000), every other star's have g >= 0.12, and T/Y
+// dwarfs' have r <= 0.50.
+constexpr float kLDwarfCorona[2] = {0.70f, 0.09f};  // r min, g max
+inline bool IsLDwarfCorona(StarFx fx, const Rgb& c) {
+  if (fx != StarFx::Corona && fx != StarFx::Edge && fx != StarFx::Hotspot) return false;
+  const float s = c.r + c.g + c.b;
+  return s > 0.f && c.r / s >= kLDwarfCorona[0] && c.g / s <= kLDwarfCorona[1];
+}
 inline std::string LookupClass(const std::string& sig) {
   if (sig.empty()) return {};
   if (auto it = learned.find(sig); it != learned.end()) return it->second;
@@ -519,10 +532,21 @@ inline std::string LookupClass(const std::string& sig) {
 // Y/T band gets the Y policy even when the journal labelled it otherwise: the
 // game draws some cold T Tauri stars exactly like Y dwarfs (Synuefe EL-E
 // a66-2, TTS at 450 K, surface 0.217,0.209, magenta disc and light), and the
-// TTS policy would give it its blue constant. The label is kept for display.
+// TTS policy would give it its blue constant. Likewise a T Tauri star with an
+// L dwarf's corona gets the L policy: the game draws some cool T Tauri stars
+// like L dwarfs (Wredguia HV-H b39-0 B, TTS at 1629 K, corona 0.892,0.041),
+// and the TTS policy gave its orange constant. The label is kept for display.
 inline std::string PolicyClass(const LightState& l) {
-  return l.cls != "T" && InBrownDwarfBand(l.signature) ? std::string("Y") : l.cls;
+  if (l.cls != "T" && InBrownDwarfBand(l.signature)) return "Y";
+  if (l.cls == "TTS" && l.l_corona) return "L";
+  return l.cls;
 }
+
+// The game's own light at a real L dwarf (chromaticity, mean of 10 L dwarfs,
+// r 0.594..0.633). Used where a T Tauri star gets the L policy: the game's
+// light for that star is not an L dwarf's (a bland magenta, 0.416,0.255 at
+// Wredguia HV-H b39-0 B), so "vanilla" would boost the wrong hue.
+inline const Rgb kLDwarfGameLight{0.623f, 0.186f, 0.191f};
 
 inline const Rgb* LookupClassColour(const std::string& cls) {
   if (cls.empty()) return nullptr;
@@ -591,7 +615,12 @@ inline const Rgb* StarColourFor(const LightState& l, Rgb& out, StarSource* used 
   switch (src) {
     case StarSource::Measured: out = l.measured_acc; return &out;
     case StarSource::Table: out = *LookupClassColour(cls); return &out;
-    case StarSource::Vanilla: return nullptr;
+    case StarSource::Vanilla:
+      if (cls == "L" && l.cls != "L") {  // lit as L by its corona (PolicyClass)
+        out = kLDwarfGameLight;
+        return &out;
+      }
+      return nullptr;
     default: out = l.star_colour; return &out;
   }
 }
@@ -1261,6 +1290,7 @@ inline void ResetMeasurement(LightState& l) {
   l.measured_peak = 0.f;
   l.measured_acc = {};
   l.ring_count = l.ring_pos = 0;
+  l.l_corona = false;  // identity-bound like the measurement
 }
 
 inline void EndFrame() {
@@ -1321,6 +1351,12 @@ inline void EndFrame() {
           reshade::log::message(reshade::log::level::info, msg.c_str());
         }
       }
+      // sticky for this identity: the corona is not matched every frame. Only
+      // from a frame whose match became the identity: when a worse-ranked draw
+      // is kept out, the identity's own draw is unmatched and the corona seen
+      // may be another star's
+      for (size_t k = 0; !keep_current && k < fm.fx_any.size() && l.known && !l.l_corona; ++k)
+        if (fm.fx_any[k] && IsLDwarfCorona(static_cast<StarFx>(k), fm.fx_sig[k])) l.l_corona = true;
     } else {
       ++l.frames_since_match;
     }
@@ -1365,7 +1401,7 @@ inline void EndFrame() {
         << " variants=" << frame_keys[i].size();
       if (!l.active) s << " dark=" << l.frames_inactive;
       if (l.known) s << " star=" << FxName(l.source) << " " << l.signature << " class=" << l.cls;
-      if (l.known && PolicyClass(l) != l.cls) s << " policy=" << PolicyClass(l) << " (Y/T band)";
+      if (l.known && PolicyClass(l) != l.cls) s << " policy=" << PolicyClass(l) << (PolicyClass(l) == "L" ? " (L corona)" : " (Y/T band)");
     }
     s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
       << " patched=" << stat_list_patched << " matched/frame=" << stat_list_matched_frame;
