@@ -313,7 +313,8 @@ Debugging a crash: `cdb -z <dump>` from `%LOCALAPPDATA%\CrashDumps` with
 Selected with **Detection = Journal + engine (test)**; the default is **Star
 draws** (sections 3–7). Built to find out which way of tying a light to its
 star is most reliable (research: `STARLIGHT-ATTRIBUTION-RESEARCH.md` in the
-owner's working folder).
+owner's working folder). **Dev build only** (section 12): players have no use
+for its ~100 MB-a-session data file, so the public build leaves it out.
 
 - **Isolation.** Every hook in `starlight.hpp`'s frame path is behind
   `experiment::Selected()` (only `Start`/`Stop` at load and unload and the
@@ -366,3 +367,27 @@ owner's working folder).
 - **Locking.** The journal thread takes `StateLock` only to publish parsed
   state or swap the row queue; file reads and writes happen outside it, and
   it makes no D3D calls (section 8).
+
+## 12. Builds
+
+Two build folders, both configured from the renodx folder (the repo root):
+
+- **Public build** (what players get), `build.vs`: a plain configure.
+  `RENODX_STARLIGHT_TEST_MODE` is 0, so the test mode is left out: there is no
+  Detection setting, `experiment::Start` starts no thread and
+  `experiment::Selected()` is always false (a `StarlightDetection=1` left in
+  ReShade.ini does nothing).
+- **Dev build** (the owner's own testing, or a tester asked for data),
+  `build.dev`: the same configure plus the define. In game the two differ
+  only by the Detection setting, which only the dev build shows.
+
+```
+cmake -S . -B build.vs -G "Visual Studio 17 2022" -A x64 -T v143,host=x64 -DCMAKE_SYSTEM_VERSION=10.0.26100.0
+cmake -S . -B build.dev -G "Visual Studio 17 2022" -A x64 -T v143,host=x64 -DCMAKE_SYSTEM_VERSION=10.0.26100.0 "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc /DRENODX_STARLIGHT_TEST_MODE=1"
+cmake --build build.vs --config Release --target elitedangerous
+cmake --build build.dev --config Release --target elitedangerous
+```
+
+From Git Bash, prefix the configure with `MSYS_NO_PATHCONV=1`, or the `/D`
+flags are rewritten into paths. The addon's file version is the time of the
+last configure, so re-run the configure before a release build.

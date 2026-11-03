@@ -161,7 +161,7 @@ struct Config {
   float match_degrees = 0.75f;
   float auto_learn = 1.f;
   float probe_log = 0.f;
-  float detection = 0.f;  // 0 star draws (default), 1 journal + engine (test mode, starlight_experiment.hpp)
+  float detection = 0.f;  // 0 star draws (default), 1 journal + engine (test mode, dev build only, starlight_experiment.hpp)
 };
 inline Config config;
 
@@ -1819,6 +1819,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                      "Class Table: use renodx-starlight.ini for stars whose class has been learned.",
           .labels = {"Vanilla", "Star Colour", "Class Table"},
       },
+#if RENODX_STARLIGHT_TEST_MODE  // dev build only (starlight_experiment.hpp)
       new Setting{
           .key = "StarlightDetection",
           .binding = &config.detection,
@@ -1834,6 +1835,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .labels = {"Star draws", "Journal + engine (test)"},
           .is_enabled = [] { return config.mode != 0.f; },
       },
+#endif
       new Setting{
           .key = "StarlightStrength",
           .binding = &config.strength,
@@ -1992,7 +1994,7 @@ inline void Use(DWORD fdw_reason) {
       reshade::register_event<reshade::addon_event::copy_resource>(OnCopyResource);
       journal_run = true;
       journal_thread = std::thread(JournalLoop);
-      experiment::Start(dir);  // idles until the test-mode detection is selected
+      experiment::Start(dir);  // dev build: idles until the test mode is selected; public build: does nothing
       break;
     }
     case DLL_PROCESS_DETACH:

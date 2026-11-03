@@ -46,6 +46,9 @@
 // the identity/class fields, and the colour pipeline (policies, saturation,
 // roll-over) is the same code fed with `view` instead of `lights`.
 //
+// Dev build only: the public build leaves this mode out (see
+// RENODX_STARLIGHT_TEST_MODE below).
+//
 // Data for statistics: while selected it appends one JSON object per line to
 // renodx-starlight-detection.jsonl next to the game executable: a "frame"
 // row per light every kSampleEvery frames with every method's verdict and
@@ -167,7 +170,18 @@ inline std::thread thread;
 inline bool session_row_written = false;
 inline std::string status_note;  // overlay: what the thread is doing
 
-inline bool Selected() { return config.detection == 1.f; }
+// The mode is for the developer's own data collection and writes a log of
+// about 100 MB a session, which players have no use for, so only the dev build
+// has it: configure that build with /DRENODX_STARLIGHT_TEST_MODE=1 (see
+// STARLIGHT-ARCHITECTURE.md, "Builds"). In the public build the Detection
+// setting is not shown, Start() starts no thread and Selected() is always
+// false, so a StarlightDetection=1 left in ReShade.ini does nothing.
+#ifndef RENODX_STARLIGHT_TEST_MODE
+#define RENODX_STARLIGHT_TEST_MODE 0
+#endif
+constexpr bool kTestModeBuilt = RENODX_STARLIGHT_TEST_MODE != 0;
+
+inline bool Selected() { return kTestModeBuilt && config.detection == 1.f; }
 
 // The light state the colour pipeline uses: the default one unless this mode
 // is selected. Follows selected_flag (set at the end of each frame), so view is
@@ -985,6 +999,7 @@ inline void ThreadLoop() {
 }
 
 inline void Start(const std::filesystem::path& game_dir) {
+  if (!kTestModeBuilt) return;  // public build: no thread, no data file
   data_path = game_dir / "renodx-starlight-detection.jsonl";
   thread_run = true;
   thread = std::thread(ThreadLoop);
