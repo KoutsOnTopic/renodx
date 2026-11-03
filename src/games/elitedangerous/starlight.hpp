@@ -1551,42 +1551,66 @@ inline void JournalLoop() {
   std::streamoff pos = 0;
   std::string pending;
   while (journal_run) {
-    std::error_code ec;
-    std::filesystem::path newest;
-    std::filesystem::file_time_type t{};
-    for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
-      const auto n = e.path().filename().wstring();  // string() throws on a file name outside the code page; uncaught on this thread, that ends the game
-      if (n.rfind(L"Journal.", 0) != 0 || e.path().extension() != ".log") continue;
-      auto wt = e.last_write_time(ec);
-      if (newest.empty() || wt > t) newest = e.path(), t = wt;
-    }
-    if (!newest.empty()) {
-      if (newest != file) {  // start at the end of a new file: only live events teach
-        file = newest;
-        pos = static_cast<std::streamoff>(std::filesystem::file_size(file, ec));
+    // Folder errors (Saved Games on a network or sync drive dropping out) go
+    // through the error codes below: a listing cut short skips the pass, and a
+    // new journal whose size cannot be read keeps the old one; either way the
+    // next pass, a second later, carries on from the same file and position.
+    // The catch is the last resort for anything else (an allocation failure):
+    // an exception escaping this thread would end the game (std::terminate).
+    // It drops the pass, which the next pass re-reads from the same position.
+    try {
+      std::error_code ec;
+      std::filesystem::path newest;
+      std::filesystem::file_time_type t{};
+      // increment(ec), not a range-for: the range-for's operator++ throws on an
+      // I/O error part-way through the listing
+      for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const auto& e = *it;
+        const auto n = e.path().filename().wstring();  // string() throws on a file name outside the code page
+        if (n.rfind(L"Journal.", 0) != 0 || e.path().extension() != ".log") continue;
+        std::error_code wt_ec;
+        auto wt = e.last_write_time(wt_ec);
+        if (newest.empty() || wt > t) newest = e.path(), t = wt;
       }
-      std::ifstream f(file, std::ios::binary);
-      f.seekg(pos);
-      std::string line;
-      while (std::getline(f, line)) {
-        if (line.find("\"event\":\"StartJump\"") != std::string::npos
-            && line.find("\"JumpType\":\"Hyperspace\"") != std::string::npos) {
-          pending = JsonField(line, "StarClass");
-          StateLock lock;
-          jump_start_time = std::chrono::steady_clock::now();
-        } else if (line.find("\"event\":\"FSDJump\"") != std::string::npos && !pending.empty()) {
-          StateLock lock;
-          arrival_class = pending;
-          ++arrival_seq;
-          arrival_frame = 0;
-          pending.clear();
+      // a listing cut short may have missed the newest file: switching to an
+      // older one and back would skip the events written meanwhile
+      if (ec) newest.clear();
+      if (!newest.empty()) {
+        if (newest != file) {  // start at the end of a new file: only live events teach
+          std::error_code size_ec;
+          const auto size = std::filesystem::file_size(newest, size_ec);
+          // on an error keep the old file (size would be -1 and stall the reader)
+          if (!size_ec) file = newest, pos = static_cast<std::streamoff>(size);
         }
+        std::ifstream f(file, std::ios::binary);
+        f.seekg(pos);
+        std::string line;
+        while (std::getline(f, line)) {
+          if (line.find("\"event\":\"StartJump\"") != std::string::npos
+              && line.find("\"JumpType\":\"Hyperspace\"") != std::string::npos) {
+            pending = JsonField(line, "StarClass");
+            StateLock lock;
+            jump_start_time = std::chrono::steady_clock::now();
+          } else if (line.find("\"event\":\"FSDJump\"") != std::string::npos && !pending.empty()) {
+            StateLock lock;
+            arrival_class = pending;
+            ++arrival_seq;
+            arrival_frame = 0;
+            pending.clear();
+          }
+        }
+        if (f.eof()) {
+          f.clear();
+          f.seekg(0, std::ios::end);
+        }
+        if (auto p = f.tellg(); p >= 0) pos = p;
       }
-      if (f.eof()) {
-        f.clear();
-        f.seekg(0, std::ios::end);
+    } catch (...) {
+      static bool logged = false;  // once: a pass that keeps failing would flood the log
+      if (!logged) {
+        logged = true;
+        reshade::log::message(reshade::log::level::warning, "starlight: journal reader error, pass skipped");
       }
-      if (auto p = f.tellg(); p >= 0) pos = p;
     }
     for (int i = 0; i < 10 && journal_run; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
