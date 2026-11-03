@@ -863,8 +863,8 @@ inline std::vector<std::filesystem::path> JournalFiles(const std::filesystem::pa
   std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> found;
   std::error_code ec;
   for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
-    const auto n = e.path().filename().string();
-    if (n.rfind("Journal.", 0) == 0 && e.path().extension() == ".log") found.emplace_back(e.last_write_time(ec), e.path());
+    const auto n = e.path().filename().wstring();  // not string(): see JournalLoop in starlight.hpp
+    if (n.rfind(L"Journal.", 0) == 0 && e.path().extension() == ".log") found.emplace_back(e.last_write_time(ec), e.path());
   }
   std::sort(found.begin(), found.end());
   std::vector<std::filesystem::path> files;

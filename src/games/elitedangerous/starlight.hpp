@@ -395,7 +395,11 @@ enum class StarSource { Constant, Measured, Table, Vanilla };
 inline std::map<std::string, StarSource> class_policy;
 inline std::map<std::string, float> class_saturation;  // class -> extra chroma multiplier ("<class>.saturation = 1.5")
 inline std::map<std::string, std::string> learned;    // signature -> class
-inline std::string table_path, signatures_path;
+// Paths, never narrow strings: path::string() converts to the system code
+// page and throws when the game folder has a character it cannot represent
+// (a Cyrillic folder on an English-locale PC), which in DllMain stopped the
+// addon from loading. The file streams open a path with the wide Windows API.
+inline std::filesystem::path table_path, signatures_path;
 
 inline uint32_t stat_gvd_uploads = 0, stat_gvd_rejected = 0, stat_star_draws = 0, stat_star_unbound = 0;
 inline uint64_t stat_gvd_size_seen = 0;
@@ -443,7 +447,7 @@ inline std::thread journal_thread;
 inline void LoadTables() {
   std::map<std::string, Rgb> table;
   std::map<std::string, std::string> sigs;
-  auto parse = [](const std::string& path, auto&& fn) {
+  auto parse = [](const std::filesystem::path& path, auto&& fn) {
     std::ifstream f(path);
     std::string line;
     while (std::getline(f, line)) {
@@ -1551,8 +1555,8 @@ inline void JournalLoop() {
     std::filesystem::path newest;
     std::filesystem::file_time_type t{};
     for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
-      auto n = e.path().filename().string();
-      if (n.rfind("Journal.", 0) != 0 || e.path().extension() != ".log") continue;
+      const auto n = e.path().filename().wstring();  // string() throws on a file name outside the code page; uncaught on this thread, that ends the game
+      if (n.rfind(L"Journal.", 0) != 0 || e.path().extension() != ".log") continue;
       auto wt = e.last_write_time(ec);
       if (newest.empty() || wt > t) newest = e.path(), t = wt;
     }
@@ -1979,8 +1983,8 @@ inline void Use(DWORD fdw_reason) {
       wchar_t exe[MAX_PATH];
       GetModuleFileNameW(nullptr, exe, MAX_PATH);
       const auto dir = std::filesystem::path(exe).parent_path();
-      table_path = (dir / "renodx-starlight.ini").string();
-      signatures_path = (dir / "renodx-starlight-signatures.ini").string();
+      table_path = dir / "renodx-starlight.ini";
+      signatures_path = dir / "renodx-starlight-signatures.ini";
       LoadTables();
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
