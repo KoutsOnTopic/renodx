@@ -15,6 +15,9 @@ permissions:
 
 jobs:
   build:
+    # upstream's own releases: skipped on forks, where they would publish
+    # nightly/snapshot releases next to the fork's own
+    if: github.repository == 'clshortfuse/renodx'
     runs-on: windows-latest
     env:
       SCCACHE_GHA_ENABLED: "true"
