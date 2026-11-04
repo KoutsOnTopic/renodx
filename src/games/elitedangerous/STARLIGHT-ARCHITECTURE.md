@@ -179,6 +179,18 @@ Class Table mode uses the ini colour for the class; `table` as a policy
 uses it inside Star Colour mode; `measured` falls back to the class-table
 colour until the first sample exists (so a Y dwarf starts purple, not blue).
 
+**S, MS and carbon stars** (`S/MS/C.source = table`, `.saturation = 2.0`,
+`.match = exact`). The game gives each class an up-close light and a much
+whiter far-away one, switching at roughly 3–10 ls (measured for every class in
+the 2 Nov test data). For S and C (and K, T Tauri) the up-close light is one
+palette value, chromaticity 0.5153,0.3507,0.1340, which the owner judged right;
+it is the table colour for these classes, and ×2.0 cancels the Saturation
+slider's ×0.5, so 100 gives exactly that light at every distance. Their draws
+look almost like K, M and T Tauri stars (signatures 0.002–0.007 apart), so
+`.match = exact` applies the policy only when the identity's own signature was
+learned with the class (`ExactOnly`, `LearnedExactly` in `PolicyClass`), and
+class propagation spreads such a class only from an exact match.
+
 ## 5. Measuring the rendered star (kept for `measured` policies)
 
 - Why not the texture: the surface shader colours by `pDiffuseTexture`

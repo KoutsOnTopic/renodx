@@ -394,6 +394,7 @@ inline std::map<std::string, Rgb> colour_table;       // class -> colour
 enum class StarSource { Constant, Measured, Table, Vanilla };
 inline std::map<std::string, StarSource> class_policy;
 inline std::map<std::string, float> class_saturation;  // class -> extra chroma multiplier ("<class>.saturation = 1.5")
+inline std::map<std::string, bool> class_exact;        // class -> policy only on an exact learned match ("<class>.match = exact")
 inline std::map<std::string, std::string> learned;    // signature -> class
 // Paths, never narrow strings: path::string() converts to the system code
 // page and throws when the game folder has a character it cannot represent
@@ -466,7 +467,12 @@ inline void LoadTables() {
   };
   std::map<std::string, StarSource> policy;
   std::map<std::string, float> saturation;
+  std::map<std::string, bool> exact;
   parse(table_path, [&](const std::string& k, const std::string& v) {
+    if (k.size() > 6 && k.compare(k.size() - 6, 6, ".match") == 0) {
+      exact[k.substr(0, k.size() - 6)] = v == "exact";
+      return;
+    }
     if (k.size() > 11 && k.compare(k.size() - 11, 11, ".saturation") == 0) {
       std::istringstream f(v);
       float x;
@@ -490,6 +496,7 @@ inline void LoadTables() {
   colour_table = std::move(table);
   class_policy = std::move(policy);
   class_saturation = std::move(saturation);
+  class_exact = std::move(exact);
   learned = std::move(sigs);
 }
 
@@ -557,9 +564,27 @@ inline std::string LookupClass(const std::string& sig) {
 // L dwarf's corona gets the L policy: the game draws some cool T Tauri stars
 // like L dwarfs (Wredguia HV-H b39-0 B, TTS at 1629 K, corona 0.892,0.041),
 // and the TTS policy gave its orange constant. The label is kept for display.
+// "<class>.match = exact": the class's policy applies only when the identity's
+// own signature was learned with that class, not when a lookalike merely sits
+// next to such an entry. S and carbon stars are drawn almost like K, M and
+// T Tauri stars (signatures 0.002..0.007 apart), so a neighbour match would
+// give those stars the S/C look. Prefix fallback like the other class keys.
+inline bool ExactOnly(const std::string& cls) {
+  if (cls.empty()) return false;
+  if (auto it = class_exact.find(cls); it != class_exact.end()) return it->second;
+  for (size_t n = cls.size() - 1; n > 0; --n)
+    if (auto it = class_exact.find(cls.substr(0, n)); it != class_exact.end()) return it->second;
+  return false;
+}
+inline bool LearnedExactly(const LightState& l) {
+  const auto it = learned.find(l.signature);
+  return it != learned.end() && it->second == l.cls;
+}
+
 inline std::string PolicyClass(const LightState& l) {
   if (l.cls != "T" && InBrownDwarfBand(l.signature)) return "Y";
   if (l.cls == "TTS" && l.l_corona) return "L";
+  if (ExactOnly(l.cls) && !LearnedExactly(l)) return {};  // lookalike: the default look
   return l.cls;
 }
 
@@ -1417,8 +1442,10 @@ inline void EndFrame() {
         l.signature = sig;
         l.cls = LookupClass(l.signature);
       }
-      // propagate a known class to the other draw kinds seen for this star
-      if (l.known && !l.cls.empty()) {
+      // propagate a known class to the other draw kinds seen for this star;
+      // an exact-match class only from an exact match, or a lookalike's
+      // other draws would become exact entries (see ExactOnly)
+      if (l.known && !l.cls.empty() && (!ExactOnly(l.cls) || LearnedExactly(l))) {
         for (size_t k = 0; k < fm.fx_any.size(); ++k) {
           if (!fm.fx_any[k]) continue;
           const std::string other = SignatureKey(static_cast<StarFx>(k), fm.fx_sig[k]);
@@ -1480,7 +1507,10 @@ inline void EndFrame() {
       if (!l.active) s << " dark=" << l.frames_inactive;
       if (l.known) s << " star=" << FxName(l.source) << " " << l.signature << " class=" << l.cls;
       else if (l.holding) s << " holding tint";
-      if (l.known && PolicyClass(l) != l.cls) s << " policy=" << PolicyClass(l) << (PolicyClass(l) == "L" ? " (L corona)" : " (Y/T band)");
+      if (l.known && PolicyClass(l) != l.cls) {
+        const std::string pc = PolicyClass(l);
+        s << " policy=" << (pc.empty() ? "default (no exact match)" : pc) << (pc == "L" ? " (L corona)" : pc == "Y" ? " (Y/T band)" : "");
+      }
     }
     s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
       << " patched=" << stat_list_patched << " matched/frame=" << stat_list_matched_frame;
