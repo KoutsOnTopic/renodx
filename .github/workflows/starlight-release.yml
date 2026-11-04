@@ -1,0 +1,210 @@
+name: Starlight release
+
+# Builds the public Starlight addon for Elite Dangerous on GitHub's own
+# runners, packs the release zip with src/games/elitedangerous/release/
+# make-zip.py and signs a build-provenance attestation for the addon and the
+# zip, so anyone can check a download was built here rather than on someone's
+# PC. The "publish" job then waits for the owner's approval (environment
+# "starlight-release"): the zip is a run artifact meanwhile, to be tested in
+# game first. Approved, it uploads that same zip to the release (replacing an
+# asset of the same name) and regenerates a "Source and verification" section
+# at the end of the release text; the text above the section is kept.
+#
+# Two checkouts: "src" is the release tag, whose source is built; "tools" is
+# the commit this workflow runs from, which supplies the packaging files. For a
+# tag pushed after these files exist the two are the same commit. v0.1.1-beta
+# was published before them, so it is built by a manual run (Actions >
+# Starlight release > Run workflow, from branch elitedangerous-starlight, tag
+# v0.1.1-beta): its source stays exactly as tagged. The run log and the
+# release text name both commits; the attestation names this workflow's
+# commit and links to the run.
+#
+# One-time setup on the fork: make elitedangerous-starlight the default
+# branch (manual runs need the workflow there); enable Actions and disable the
+# upstream "nightly" and "snapshot" workflows (they publish releases of their
+# own); create the environment "starlight-release" with the owner as required
+# reviewer (without it, publishing does not wait).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (for example v0.1.1-beta)
+        required: true
+
+concurrency:
+  group: starlight-release-${{ inputs.tag || github.ref_name }}
+
+permissions: {}  # each job asks for what it needs
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      id-token: write      # sign the attestation
+      attestations: write
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    outputs:
+      tag: ${{ steps.pack.outputs.tag }}
+      src_sha: ${{ steps.pack.outputs.src_sha }}
+      tools_sha: ${{ steps.pack.outputs.tools_sha }}
+      zip_sha256: ${{ steps.pack.outputs.zip_sha256 }}
+      addon_sha256: ${{ steps.pack.outputs.addon_sha256 }}
+      attestation_url: ${{ steps.attest.outputs.attestation-url }}
+    steps:
+      - name: Check out the release tag (built)
+        uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ env.TAG }}
+          path: src
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check out this workflow's commit (packaging files)
+        uses: actions/checkout@v4.1.7
+        with:
+          path: tools
+          persist-credentials: false
+
+      - name: Check the input is a tag
+        shell: pwsh
+        run: |
+          git -C src ls-remote --exit-code --tags origin "refs/tags/$env:TAG" | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error "$env:TAG is not a tag of this repository"; exit 1 }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up shader tools
+        shell: pwsh
+        working-directory: src
+        run: .\scripts\setup-dev-env.ps1 -Update -Tools dxc,slang,glslang
+
+      # No msvc-dev-cmd step (upstream's build workflows have one): the Visual
+      # Studio generator finds MSVC itself and this addon needs nothing else
+      # from a developer prompt.
+      - name: Configure (public build, no test mode)
+        working-directory: src
+        run: cmake --preset vs-x64
+
+      - name: Build the Elite Dangerous addon
+        working-directory: src
+        run: cmake --build --preset vs-x64-release --target elitedangerous
+
+      - name: Pack the release zip
+        id: pack
+        shell: pwsh
+        run: |
+          $zip = "renodx-elitedangerous-starlight-$env:TAG.zip"
+          $addon = "src/build.vs/Release/renodx-elitedangerous.addon64"
+          python tools/src/games/elitedangerous/release/make-zip.py $addon $env:TAG $zip
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # make-zip.py takes the ini from "tools": it must be the tag's own
+          if ((Get-FileHash src/src/games/elitedangerous/renodx-starlight.ini).Hash -ne `
+              (Get-FileHash tools/src/games/elitedangerous/renodx-starlight.ini).Hash) {
+            Write-Error "renodx-starlight.ini differs between the tag and this commit"; exit 1
+          }
+          @(
+            "tag=$env:TAG",
+            "src_sha=$(git -C src rev-parse HEAD)",
+            "tools_sha=$(git -C tools rev-parse HEAD)",
+            "zip_sha256=$((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower())",
+            "addon_sha256=$((Get-FileHash -Algorithm SHA256 $addon).Hash.ToLower())"
+          ) | Add-Content -Path $env:GITHUB_OUTPUT
+
+      - name: Attest the addon and the zip
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            src/build.vs/Release/renodx-elitedangerous.addon64
+            renodx-elitedangerous-starlight-${{ env.TAG }}.zip
+
+      - name: Keep the zip for testing and publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: renodx-elitedangerous-starlight-${{ env.TAG }}
+          path: renodx-elitedangerous-starlight-${{ env.TAG }}.zip
+          retention-days: 30
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: starlight-release  # waits for the owner's approval
+    permissions:
+      contents: write  # upload the zip and edit the release text
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      SRC_SHA: ${{ needs.build.outputs.src_sha }}
+      TOOLS_SHA: ${{ needs.build.outputs.tools_sha }}
+      ZIP_SHA256: ${{ needs.build.outputs.zip_sha256 }}
+      ADDON_SHA256: ${{ needs.build.outputs.addon_sha256 }}
+      ATTESTATION_URL: ${{ needs.build.outputs.attestation_url }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Fetch the tested zip
+        uses: actions/download-artifact@v4
+        with:
+          name: renodx-elitedangerous-starlight-${{ needs.build.outputs.tag }}
+
+      - name: Upload the zip and update the verification section
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)  # gh prints UTF-8
+          $zip = "renodx-elitedangerous-starlight-$env:TAG.zip"
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower() -ne $env:ZIP_SHA256) {
+            Write-Error "the downloaded zip is not the one the build job made"; exit 1
+          }
+          $created = $false
+          gh release view $env:TAG --json tagName *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --draft --prerelease --title "Starlight $env:TAG" --notes " "
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            $created = $true
+          }
+          $body = (gh release view $env:TAG --json body --jq '.body // ""') -join "`n"
+          if ($LASTEXITCODE -ne 0) { Write-Error "could not read the release text; nothing changed"; exit 1 }
+          if (-not $created -and -not $body.Trim()) {
+            Write-Error "the release text came back empty; not touching it"; exit 1
+          }
+          # a copy of the text as it was, kept as an artifact (next step)
+          $body | Set-Content -Encoding utf8 -NoNewline release-text-before.md
+          # gh deletes the old asset before uploading: the tested zip stays in
+          # the run's artifacts if this fails
+          gh release upload $env:TAG $zip --clobber
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # everything from the marker down is regenerated on every run
+          $marker = "<!-- starlight-verification -->"
+          $i = $body.IndexOf($marker)
+          if ($i -ge 0) { $body = $body.Substring(0, $i) }
+          $server = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+          $run = "$server/actions/runs/$env:GITHUB_RUN_ID"
+          $record = if ($env:ATTESTATION_URL) { $env:ATTESTATION_URL } else { "$server/attestations" }
+          $section = @(
+            $marker,
+            "### Source and verification",
+            "- Built by GitHub Actions from tag ``$env:TAG`` (commit ``$($env:SRC_SHA.Substring(0, 7))``) in [this build]($run); packed by [make-zip.py]($server/blob/$env:TOOLS_SHA/src/games/elitedangerous/release/make-zip.py) at ``$($env:TOOLS_SHA.Substring(0, 7))``.",
+            "- Source: [src/games/elitedangerous]($server/tree/$env:TAG/src/games/elitedangerous); design notes: [STARLIGHT-ARCHITECTURE.md]($server/blob/$env:TAG/src/games/elitedangerous/STARLIGHT-ARCHITECTURE.md).",
+            "- ``$zip`` SHA-256: ``$env:ZIP_SHA256`` (the addon inside: ``$env:ADDON_SHA256``).",
+            "- Signed build record: [attestation]($record). With the GitHub CLI: ``gh attestation verify $zip -R $env:GITHUB_REPOSITORY``",
+            "- Developed with help from Claude (Anthropic); each Starlight commit says so in a ``Co-Authored-By`` line."
+          ) -join "`n"
+          ($body.TrimEnd() + "`n`n" + $section + "`n") | Set-Content -Encoding utf8 -NoNewline notes.md
+          gh release edit $env:TAG --notes-file notes.md
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "SHA-256 $env:ZIP_SHA256  $zip" | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+
+      - name: Keep the release text as it was before this run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-text-before-${{ env.TAG }}
+          path: release-text-before.md
+          if-no-files-found: ignore

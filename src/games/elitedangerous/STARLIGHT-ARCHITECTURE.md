@@ -3,7 +3,8 @@
 Starlight is the part of the Elite Dangerous RenoDX addon that recolours the
 light cast by stars so it matches the star casting it. Code: `starlight.hpp`
 (the module), `addon.cpp` (wiring and the star-draw observers),
-`renodx-starlight.ini` (per-class table and policies). The chronological
+`renodx-starlight.ini` (per-class table and policies), `release/` (the
+release zip's packing script, readme and signatures seed; section 12). The chronological
 history, reverse-engineering data and open items are in
 `STARLIGHT-HANDOFF.md` in the owner's working folder; this file explains how
 the module is built and why each piece is the way it is.
@@ -403,3 +404,31 @@ cmake --build build.dev --config Release --target elitedangerous
 From Git Bash, prefix the configure with `MSYS_NO_PATHCONV=1`, or the `/D`
 flags are rewritten into paths. The addon's file version is the time of the
 last configure, so re-run the configure before a release build.
+
+**Release zip.** `.github/workflows/starlight-release.yml` builds the public
+addon from a `v*` tag on GitHub's runners (`vs-x64` preset), packs the zip with
+`release/make-zip.py` and signs a build-provenance attestation for the addon
+and the zip. Its publish job then waits for the owner's approval (environment
+`starlight-release`), so the zip, a run artifact meanwhile, can be tested in
+game first; approved, it uploads that same zip to the release, replacing an
+asset of the same name, and regenerates a "Source and verification" section
+(SHA-256, commits, build log, attestation link) at the end of the release
+text, keeping the text above it. A tag pushed with the workflow in place
+triggers it; an older tag (v0.1.1-beta) is built by a manual run from this
+branch, which checks out the tag for the source and the run's commit for the
+packing files. The zip holds the addon, `renodx-starlight.ini`, the seed
+`release/renodx-starlight-signatures.ini` and `release/README.txt` with the
+version, the seed's entry count and the MIT text filled in; text files get
+CRLF and one fixed timestamp, so they depend only on the repository. The addon
+does not rebuild byte for byte (it embeds its build time and depends on the
+compiler version), so a download is checked through its attestation.
+
+**The signatures seed** (147 entries) is the owner's learned file (264
+entries, 2 Nov) checked against the stars of the 2 Nov test-mode data whose
+drawn radius matched a journal Scan radius exactly: 14 wrong labels corrected,
+18 verified brown-dwarf entries added (stars that were lit as ordinary stars),
+then every entry removed whose removal does not change any light in Star
+Colour mode, except the Surface entries that can be the nearest neighbour of a
+point in the Y/T band (their labels still propagate to the star's other
+draws). Checked in Python ports of the lookup against every 0.001 grid point
+and 700 simulated visit sequences: no star lit worse than with the full file.
