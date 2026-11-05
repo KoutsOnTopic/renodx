@@ -147,6 +147,23 @@ the owner with a temporary slider), `TTS` pinned to the default because the
 prefix fallback would otherwise give T Tauri stars the T policy. Unlearned
 stars get the default. A heuristic that compared hues of measured vs
 constant was tried and removed: explicit per-class rules are predictable.
+All per-class keys share one prefix lookup (`FindByClass`).
+
+**B stars** (`B.min_saturation = 0.75`, `ClassSaturationFor`). B designer
+colours run from violet (hue ~248°) to a pale sky blue (204–227°). At slider
+100 the pale ones came out at HSV saturation 0.29–0.55, while the game's own
+light at them measured 0.56–0.82 (~0.75 near the star; test log, 5 Nov), so
+the owner found them duller than vanilla. The violet ones were already
+0.70–0.86. A lower limit raises the class multiplier only as far as the tint
+needs to reach 0.75 at slider 100 (closed form: `Saturate` keeps the channel
+order, so its HSV saturation is solvable for the multiplier). The hue is
+unchanged, the violet ones are untouched (HD 196088, 0.70, gets ×1.25), and the
+slider still scales everything proportionally. Owner's choices: a fixed limit
+at the game's up-close level rather than tracking the game's light live (that
+light changes with distance, and the tint would follow it); keep each star's
+hue; B only, as an ini key. The multiplier is part of the goal saturation, so
+hand-overs roll it over like any tint (§7). It applies in Class Table mode (dev build) too
+(the placeholder table B lifts ×8.2 to the same 0.75).
 
 **The Y/T band beats the journal label** (`PolicyClass`): a star whose
 surface signature lies in the band gets the Y policy even if the journal
@@ -176,7 +193,7 @@ ends up like a real L dwarf. Side effect: an L dwarf misread as TTS by the
 nearest-signature match (Wredguia CZ-M b35-0 B, surface 0.710,0.248) is lit
 as L too.
 
-Class Table mode uses the ini colour for the class; `table` as a policy
+Class Table mode (dev build only, §6) uses the ini colour for the class; `table` as a policy
 uses it inside Star Colour mode; `measured` falls back to the class-table
 colour until the first sample exists (so a Y dwarf starts purple, not blue).
 
@@ -231,14 +248,18 @@ class propagation spreads such a class only from an exact match.
   is known to hold light colours (`hot_kinds`), discovered by a 1 MB search
   budget every 30 frames or the manual scan. Reason: terrain sun records live
   in ~320 KB buffers; scanning every large write would cost frame time.
-- **Saturation:** `Saturate(out, slider × class)`; slider 100 = ×0.5, max 200
+- **Saturation:** `Saturate(out, slider × class)` (class = `.saturation`, lifted
+  by `.min_saturation`, §4); slider 100 = ×0.5 (`kNaturalChroma`), max 200
   (= ×1.0, the raw colour), because raw star colours are more saturated than
   looks natural. The owner first settled on 0.7, then on 0.5 (G and K stars
   look most accurate, far less colour clipping in SDR). Setting key
   `StarlightTintChroma`, renamed on each rescale so old percentages are not
   reused (`StarlightSaturation`, then `StarlightChroma`). Modes: Vanilla / Star Colour / Class Table
   (key `StarlightColour`; the old Saturation mode was removed as it only
-  complicated A/B testing).
+  complicated A/B testing). Class Table is offered only in the dev build: its
+  placeholder colours looked much like vanilla (owner, 5 Nov). A saved 2 is
+  capped to Star Colour on load in the regular build, which still ships and
+  reads the ini because Star Colour's class rules live there.
 - **Two light slots stay independent** (`lights[0]`, `lights[1]`, copies
   matched per slot). Required: an L and a B lighting a planet's rings in their
   own colours looked natural and must keep working.
@@ -269,6 +290,25 @@ pale and near-neutral next to the tints. The owner saw it as a flicker. Side
 effect, the owner's choice: on opening the System Map its own light keeps the
 star's tint for up to 0.5 s.
 
+**Scanner hold.** Zoomed in on a body, the Full Spectrum System Scanner
+lights it from that body's side: light 0 swung 70–165° away from its star
+for each zoom (CSI+46-20087, 5 Nov), no star is drawn there, so the identity
+dropped and the body was lit in the game's own colour. The journal thread
+reads `Status.json` 4 times a second (only a read holding both `Flags` and
+`GuiFocus` counts: the game rewrites the file in place). While `GuiFocus` is 9
+(`scanner_open`), a known light keeps its identity and tint whatever its
+direction does, and its reference direction (`l.dir`) stays where it was before
+the scanner, so a swing spread over several frames is caught as well. Once
+it is more than 3° off, star matches are ignored (no take-over, no class
+propagation) and do not count as silence for `kIdentityHold`. On each light's first lit frame
+after the scanner closes, the direction is taken as it is without a jump check: the ship
+keeps flying in supercruise while scanning, so the star can be more than 3°
+from the frozen direction by then, and if it is not drawn that frame the jump
+would drop it. While the scanner is open the star readback is not armed and
+the test mode makes no radius links, since a star drawn near a held light may
+be another one. The owner's choice: no change of star while scanning, even
+for a body that orbits another star.
+
 ## 8. Locking rule (crash lesson)
 
 `StateLock` wraps `state_mutex` and records per thread that it is held;
@@ -283,7 +323,8 @@ aborted the process. Readback work runs between short locked sections.
 
 - **Probe log** (every 120 frames): uploads, rejected uploads, star draws per
   kind, per light direction/colour/best cos/variants/identity/class, copies
-  patched. First thing to read for any report.
+  patched, `scanner open` while the scanner is open (§7). First thing to read
+  for any report.
 - **`starlight star:`** once per distinct star constant block: c0..c3, the
   game light, bound textures.
 - **`starlight readback:`** per accepted/dropped sample (30 per star, then 1
@@ -400,6 +441,20 @@ cmake -S . -B build.dev -G "Visual Studio 17 2022" -A x64 -T v143,host=x64 -DCMA
 cmake --build build.vs --config Release --target elitedangerous
 cmake --build build.dev --config Release --target elitedangerous
 ```
+
+**Output setting** (`OutputMode`, addon.cpp, global): 0 = HDR (RenoDX
+swapchain, tone mapping, upgrades), 1 = SDR (the game's own image, Starlight
+only), 2 = Auto, the default. 0 and 1 predate Auto, so a saved choice keeps
+its meaning. Which one runs is decided once in DllMain, because it decides
+what gets hooked. Auto reads Windows' HDR switch there for the display the
+game window is on (main display if no window is found): ReShade loads add-ons
+inside the game's first D3D11CreateDevice, after the window exists and before
+the swap chain does. Display Config API only, no DXGI, since ReShade is the
+game's dxgi.dll and the loader lock is held. A switch that cannot be read
+gives HDR, the output before Auto existed. If the swap chain later turns out
+to be on a display whose switch reads the other way from Auto's reading
+(checked whatever the setting, so switching to Auto mid-session shows it), the
+panel asks the player to pick HDR or SDR by hand.
 
 From Git Bash, prefix the configure with `MSYS_NO_PATHCONV=1`, or the `/D`
 flags are rewritten into paths. The addon's file version is the time of the

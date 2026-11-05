@@ -130,9 +130,51 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 
     __ALL_CUSTOM_SHADERS};
 
-// 0 = HDR (RenoDX swapchain + tone mapping), 1 = SDR (vanilla image, Starlight only)
-float output_sdr = 0.f;
-bool output_sdr_at_start = false;
+// Output setting: 0 = HDR (RenoDX swapchain + tone mapping), 1 = SDR (vanilla
+// image, Starlight only), 2 = Auto (the default: Windows' HDR switch for the
+// game's display, read at launch). 0 and 1 predate Auto, so a saved choice
+// keeps its meaning.
+float output_mode = 2.f;
+bool output_sdr_at_start = false;  // what this session runs: decided once in DllMain
+bool auto_sdr = false;             // Auto's choice at launch
+std::string auto_reading;          // what Auto read, for the settings panel and the log
+bool auto_mismatch = false;        // the swap chain's display reads the other way (OnInitSwapchain)
+
+bool SdrSelected() { return output_mode == 2.f ? auto_sdr : output_mode == 1.f; }
+
+// Auto: is Windows HDR on for the game's display? Asked in DllMain, because
+// what gets hooked depends on it. ReShade loads add-ons inside the game's first
+// D3D11CreateDevice: the game window already exists (found by its class,
+// logged as "FrontierDevelopmentsAppWinClass"), the swap chain does not, so the
+// display is the one the window is on, or the main display if no window is
+// found. Display Config API (user32) only, no DXGI: ReShade is the game's
+// dxgi.dll, and making a factory under the loader lock would re-enter it.
+// Empty when the display's switch cannot be read; *display names the display.
+std::optional<bool> ReadWindowsHdr(std::string* display) {
+  HWND window = nullptr;
+  EnumWindows(
+      [](HWND hwnd, LPARAM out) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        char cls[64] = "";
+        if (pid != GetCurrentProcessId() || GetClassNameA(hwnd, cls, sizeof(cls)) == 0
+            || std::strcmp(cls, "FrontierDevelopmentsAppWinClass") != 0) {
+          return TRUE;
+        }
+        *reinterpret_cast<HWND*>(out) = hwnd;
+        return FALSE;
+      },
+      reinterpret_cast<LPARAM>(&window));
+  HMONITOR monitor = window != nullptr ? MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY)
+                                       : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+  MONITORINFOEX info = {};
+  info.cbSize = sizeof(info);
+  *display = GetMonitorInfo(monitor, &info) ? std::string(info.szDevice) : std::string("unknown display");
+  *display += window != nullptr ? " (game window)" : " (main display, no game window yet)";
+  const auto path = renodx::utils::platform::GetPathInfo(monitor);
+  if (!path.has_value()) return std::nullopt;
+  return renodx::utils::swapchain::GetHDREnabled(path.value());
+}
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
@@ -384,6 +426,16 @@ bool fired_on_init_swapchain = false;
 void OnInitSwapchain(reshade::api::swapchain* swapchain, bool resize) {
   if (fired_on_init_swapchain) return;
   fired_on_init_swapchain = true;
+  // Auto read the display before the swap chain existed: say so if the swap
+  // chain's display has its HDR switch the other way (the window moved to
+  // another display after the add-on loaded). Checked whatever the setting,
+  // so switching to Auto later in the session shows it too.
+  const auto display = renodx::utils::swapchain::GetDisplayInfo(swapchain);
+  if (display.display_config.has_value() && display.hdr_enabled == auto_sdr) {
+    auto_mismatch = true;
+    reshade::log::message(reshade::log::level::warning,
+                          "RenoDX Elite: the game's display has Windows HDR the other way from Auto's choice at launch");
+  }
   auto peak = renodx::utils::swapchain::GetPeakNits(swapchain);
   if (peak.has_value()) {
     settings[1]->default_value = peak.value();
@@ -424,30 +476,58 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::shader::expected_constant_buffer_index = 13;
         renodx::mods::shader::force_pipeline_cloning = true;
 
+        // Read even when HDR or SDR is picked: the panel shows the reading, and
+        // switching to Auto later needs it for the restart notice
+        {
+          std::string display;
+          const auto hdr = ReadWindowsHdr(&display);
+          // unreadable: HDR, the output this addon had before Auto existed
+          auto_sdr = hdr.has_value() && !hdr.value();
+          auto_reading = !hdr.has_value() ? "could not read Windows HDR for " + display + ", so HDR (pick SDR by hand on an SDR display)"
+                                          : "Windows HDR is " + std::string(auto_sdr ? "off" : "on") + " for " + display
+                                                + ", so " + (auto_sdr ? "SDR" : "HDR");
+        }
+
         // Output + Starlight panels go just before the Links section
         {
           auto extra = elitedangerous::starlight::Settings();
           extra.insert(extra.begin(), {
                                           new renodx::utils::settings::Setting{
                                               .key = "OutputMode",
-                                              .binding = &output_sdr,
+                                              .binding = &output_mode,
                                               .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-                                              .default_value = 0.f,
+                                              .default_value = 2.f,
                                               .can_reset = false,
                                               .label = "Output",
                                               .section = "Output",
                                               .tooltip = "SDR keeps the game's own SDR image (no HDR swapchain, no RenoDX\n"
                                                          "tone mapping or upgrades) and only runs Starlight.\n"
+                                                         "Auto picks HDR or SDR at launch from the Windows HDR\n"
+                                                         "switch of the display the game is on.\n"
                                                          "Restart the game after changing.",
-                                              .labels = {"HDR (RenoDX)", "SDR (vanilla image + Starlight)"},
+                                              .labels = {"HDR (RenoDX)", "SDR (vanilla image + Starlight)", "Auto"},
                                               .is_global = true,
+                                          },
+                                          new renodx::utils::settings::Setting{
+                                              .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                                              .label = "Auto: " + auto_reading + ".",
+                                              .section = "Output",
+                                              .is_visible = []() { return output_mode == 2.f && !auto_mismatch; },
+                                          },
+                                          new renodx::utils::settings::Setting{
+                                              .value_type = renodx::utils::settings::SettingValueType::TEXT,
+                                              .label = "Auto: " + auto_reading + ", but the game's display has Windows HDR "
+                                                       + (auto_sdr ? "on" : "off") + ". Pick HDR or SDR by hand.",
+                                              .section = "Output",
+                                              .tint = 0xFF5A16,
+                                              .is_visible = []() { return output_mode == 2.f && auto_mismatch; },
                                           },
                                           new renodx::utils::settings::Setting{
                                               .value_type = renodx::utils::settings::SettingValueType::TEXT,
                                               .label = "Restart the game to apply the output change.",
                                               .section = "Output",
                                               .tint = 0xFF5A16,
-                                              .is_visible = []() { return (output_sdr != 0.f) != output_sdr_at_start; },
+                                              .is_visible = []() { return SdrSelected() != output_sdr_at_start; },
                                           },
                                       });
           auto pos = std::find_if(settings.begin(), settings.end(), [](auto* s) { return s->section == "Links"; });
@@ -456,11 +536,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
         // Load settings now: the output mode decides what gets hooked
         renodx::utils::settings::Use(DLL_PROCESS_ATTACH, &settings, &OnPresetOff);
-        output_sdr_at_start = output_sdr != 0.f;
-        if (output_sdr_at_start) {
-          reshade::log::message(reshade::log::level::info, "RenoDX Elite: SDR output, Starlight only");
-          initialized = true;  // skip the HDR swapchain setup below
+        output_sdr_at_start = SdrSelected();
+        {
+          std::string msg = std::string("RenoDX Elite: ") + (output_sdr_at_start ? "SDR output, Starlight only" : "HDR output")
+                            + (output_mode == 2.f ? " (Auto: " + auto_reading + ")" : " (picked in settings)");
+          reshade::log::message(reshade::log::level::info, msg.c_str());
         }
+        if (output_sdr_at_start) initialized = true;  // skip the HDR swapchain setup below
       }
       if (!initialized) {
         // Swapchain Proxy

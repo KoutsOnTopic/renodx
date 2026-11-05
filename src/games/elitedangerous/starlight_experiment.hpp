@@ -486,7 +486,10 @@ inline const Remembered* Recall(const float dir[3], int light) {
 inline void ResolveClass(int i, const LightState& m, Verdict& vd) {
   const std::string& sig = m.signature;
   // 1. radius link (this frame or earlier this visit)
-  if (ev.linked[i] && ev.best_addr[i] == journal.address && m.frames_since_match == 0) visit.link[sig] = ev.best_body[i];
+  // not while the scanner is open: the scanner hold keeps the identity (and its
+  // frames_since_match) while the drawn star near the swung light is another one
+  if (ev.linked[i] && ev.best_addr[i] == journal.address && m.frames_since_match == 0 && !scanner_open)
+    visit.link[sig] = ev.best_body[i];
   if (auto it = visit.link.find(sig); it != visit.link.end()) {
     if (const JStar* s = FindStar(it->second); s != nullptr) {
       vd.cls = s->type, vd.how = "radius link", vd.body = s->body;
@@ -757,17 +760,7 @@ inline void DrawOverlay() {  // StateLock held by the caller
 }
 
 // ---- journal thread ----------------------------------------------------------
-inline double JsonNumber(const std::string& line, const char* key, double fallback = 0.0) {
-  const std::string k = std::string("\"") + key + "\":";
-  const auto a = line.find(k);
-  if (a == std::string::npos) return fallback;
-  const char* p = line.c_str() + a + k.size();
-  while (*p == ' ') ++p;
-  char* end = nullptr;
-  const double v = std::strtod(p, &end);
-  return end == p ? fallback : v;
-}
-
+// JsonNumber is in starlight.hpp (the default path reads Status.json too)
 inline uint64_t JsonUint(const std::string& line, const char* key) {
   const std::string k = std::string("\"") + key + "\":";
   const auto a = line.find(k);

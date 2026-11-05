@@ -18,8 +18,8 @@ REQUIREMENTS
   support" download), installed for EliteDangerous64.exe with the
   DirectX 10/11/12 API. Tested with ReShade 6.8.0. If you already use the
   RenoDX Elite Dangerous mod you have this.
-- HDR output needs an HDR monitor with Windows HDR on. On an SDR monitor,
-  set Output to SDR (see SETTINGS).
+- HDR output needs an HDR monitor with Windows HDR on. Output is on Auto by
+  default, which picks HDR or SDR to match Windows (see SETTINGS).
 
 
 INSTALL
@@ -40,17 +40,21 @@ INSTALL
 SETTINGS  (in game: press Home to open ReShade, then the RenoDX tab; Output
 and Starlight are near the bottom, above Links)
 Output
-  HDR (RenoDX)                     RenoDX HDR, the default.
+  Auto                             the default on a new install: at launch,
+                                   HDR if Windows HDR is on for the game's
+                                   display, SDR if it is off. The panel says
+                                   what it found, and warns if the game ends
+                                   up on a display set the other way.
+  HDR (RenoDX)                     RenoDX HDR.
   SDR (vanilla image + Starlight)  the game's own SDR picture with only
                                    Starlight added; the RenoDX tone-mapping
                                    sliders then do nothing.
-  Restart the game after changing it.
+  Restart the game after changing it. A choice saved by an earlier version
+  is kept; pick Auto to switch to it.
 Starlight
   Starlight Colour  Star Colour (default) tints each light with its star.
                     Vanilla turns Starlight off (use it to compare: the
                     RenoDX preset "Off" does not turn Starlight off).
-                    Class Table is experimental (placeholder colours per
-                    star class).
   Strength          how far each light moves towards its star's colour
                     (100 = all the way).
   Saturation        chroma of the starlight. 100 is the natural look;
@@ -66,6 +70,9 @@ Leave the other buttons alone unless asked for a bug report.
 
 KNOWN LIMITS (beta)
 - Opening the System Map can keep the star's tint for up to half a second.
+- The Full Spectrum System Scanner keeps the tint of the star lighting you
+  while it is open, even when you zoom into a body orbiting another star.
+  The System Map does not do this yet.
 - A light whose star is not drawn (a far-away primary seen from a distant
   companion) keeps roughly the game's own colour.
 - An L dwarf that is not in the signatures file is lit like an ordinary

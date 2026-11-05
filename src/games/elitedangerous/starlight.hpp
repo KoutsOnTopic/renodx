@@ -157,13 +157,16 @@ inline const std::unordered_map<uint32_t, StarShader> kStarShaders = {
 struct Config {
   float mode = 1.f;  // 0 vanilla, 1 star colour, 2 class table
   float strength = 1.f;
-  float saturation = 1.f;
+  float saturation = 1.f;  // chroma multiplier, kNaturalChroma at slider 100
   float match_degrees = 0.75f;
   float auto_learn = 1.f;
   float probe_log = 0.f;
   float detection = 0.f;  // 0 star draws (default), 1 journal + engine (test mode, dev build only, starlight_experiment.hpp)
 };
 inline Config config;
+// The chroma multiplier at Saturation 100, the natural look (slider setting
+// StarlightTintChroma). Per-class saturation limits are set at this point.
+constexpr float kNaturalChroma = 0.5f;
 
 // ---- small maths -----------------------------------------------------------
 struct Rgb {
@@ -394,6 +397,7 @@ inline std::map<std::string, Rgb> colour_table;       // class -> colour
 enum class StarSource { Constant, Measured, Table, Vanilla };
 inline std::map<std::string, StarSource> class_policy;
 inline std::map<std::string, float> class_saturation;  // class -> extra chroma multiplier ("<class>.saturation = 1.5")
+inline std::map<std::string, float> class_min_saturation;  // class -> lowest HSV saturation of the tint at Saturation 100 ("<class>.min_saturation = 0.75")
 inline std::map<std::string, bool> class_exact;        // class -> policy only on an exact learned match ("<class>.match = exact")
 inline std::map<std::string, std::string> learned;    // signature -> class
 // Paths, never narrow strings: path::string() converts to the system code
@@ -441,6 +445,9 @@ inline uint64_t identity_seq = 0;
 // late, so half way would not lie in the tunnel: skip that check (the next
 // arrival catches a stale light; it cannot match in a tunnel either).
 constexpr std::chrono::seconds kMinJumpSeconds{10};
+// Status.json GuiFocus 9: the Full Spectrum System Scanner is open (journal
+// thread, under the lock; read by the scanner hold in EndFrame)
+inline bool scanner_open = false;
 inline std::atomic_bool journal_run = false;
 inline std::thread journal_thread;
 
@@ -466,11 +473,20 @@ inline void LoadTables() {
     }
   };
   std::map<std::string, StarSource> policy;
-  std::map<std::string, float> saturation;
+  std::map<std::string, float> saturation, min_saturation;
   std::map<std::string, bool> exact;
   parse(table_path, [&](const std::string& k, const std::string& v) {
     if (k.size() > 6 && k.compare(k.size() - 6, 6, ".match") == 0) {
       exact[k.substr(0, k.size() - 6)] = v == "exact";
+      return;
+    }
+    // before ".saturation" for clarity; "_saturation" would not match it anyway
+    if (k.size() > 15 && k.compare(k.size() - 15, 15, ".min_saturation") == 0) {
+      std::istringstream f(v);
+      float x;
+      // below 1: at 1 the weakest channel lands exactly on zero, where float
+      // rounding can push it under and Saturate's clamp would shift the hue
+      if ((f >> x) && x >= 0.f && x < 1.f) min_saturation[k.substr(0, k.size() - 15)] = x;
       return;
     }
     if (k.size() > 11 && k.compare(k.size() - 11, 11, ".saturation") == 0) {
@@ -496,6 +512,7 @@ inline void LoadTables() {
   colour_table = std::move(table);
   class_policy = std::move(policy);
   class_saturation = std::move(saturation);
+  class_min_saturation = std::move(min_saturation);
   class_exact = std::move(exact);
   learned = std::move(sigs);
 }
@@ -556,6 +573,15 @@ inline std::string LookupClass(const std::string& sig) {
   return best;
 }
 
+// A class's entry in one of the per-class ini maps. Every class key falls back
+// by prefix ("K_OrangeGiant" -> "K", "DAB" -> "D"); nullptr if none matches.
+template <typename T>
+inline const T* FindByClass(const std::map<std::string, T>& m, const std::string& cls) {
+  for (size_t n = cls.size(); n > 0; --n)
+    if (auto it = m.find(cls.substr(0, n)); it != m.end()) return &it->second;
+  return nullptr;
+}
+
 // The class whose policy, saturation and table colour apply. A star in the
 // Y/T band gets the Y policy even when the journal labelled it otherwise: the
 // game draws some cold T Tauri stars exactly like Y dwarfs (Synuefe EL-E
@@ -570,11 +596,8 @@ inline std::string LookupClass(const std::string& sig) {
 // T Tauri stars (signatures 0.002..0.007 apart), so a neighbour match would
 // give those stars the S/C look. Prefix fallback like the other class keys.
 inline bool ExactOnly(const std::string& cls) {
-  if (cls.empty()) return false;
-  if (auto it = class_exact.find(cls); it != class_exact.end()) return it->second;
-  for (size_t n = cls.size() - 1; n > 0; --n)
-    if (auto it = class_exact.find(cls.substr(0, n)); it != class_exact.end()) return it->second;
-  return false;
+  const bool* exact = FindByClass(class_exact, cls);
+  return exact != nullptr && *exact;
 }
 inline bool LearnedExactly(const LightState& l) {
   const auto it = learned.find(l.signature);
@@ -594,13 +617,7 @@ inline std::string PolicyClass(const LightState& l) {
 // Wredguia HV-H b39-0 B), so "vanilla" would boost the wrong hue.
 inline const Rgb kLDwarfGameLight{0.623f, 0.186f, 0.191f};
 
-inline const Rgb* LookupClassColour(const std::string& cls) {
-  if (cls.empty()) return nullptr;
-  if (auto it = colour_table.find(cls); it != colour_table.end()) return &it->second;
-  for (size_t n = cls.size() - 1; n > 0; --n)  // "K_OrangeGiant" -> "K"
-    if (auto it = colour_table.find(cls.substr(0, n)); it != colour_table.end()) return &it->second;
-  return nullptr;
-}
+inline const Rgb* LookupClassColour(const std::string& cls) { return FindByClass(colour_table, cls); }
 
 // ---- colour remap ----------------------------------------------------------
 // Saturation in the HSV sense, 0 = grey, 1 = a pure hue.
@@ -625,22 +642,37 @@ inline float HueDistance(const Rgb& a, const Rgb& b) {
   return d > 180.f ? 360.f - d : d;
 }
 
-// Policy for a class, with the same prefix fallback as the colour table
-// ("K_OrangeGiant" -> "K"); unlearned classes get the default.
+// Policy for a class; unlearned classes get the default.
 inline StarSource LookupPolicy(const std::string& cls) {
-  if (cls.empty()) return StarSource::Constant;
-  if (auto it = class_policy.find(cls); it != class_policy.end()) return it->second;
-  for (size_t n = cls.size() - 1; n > 0; --n)
-    if (auto it = class_policy.find(cls.substr(0, n)); it != class_policy.end()) return it->second;
-  return StarSource::Constant;
+  const StarSource* policy = FindByClass(class_policy, cls);
+  return policy != nullptr ? *policy : StarSource::Constant;
 }
 
-inline float LookupClassSaturation(const std::string& cls) {
-  if (cls.empty()) return 1.f;
-  if (auto it = class_saturation.find(cls); it != class_saturation.end()) return it->second;
-  for (size_t n = cls.size() - 1; n > 0; --n)
-    if (auto it = class_saturation.find(cls.substr(0, n)); it != class_saturation.end()) return it->second;
-  return 1.f;
+// The class's chroma multiplier for a tint of this colour: "<class>.saturation"
+// (1 if unset), raised just enough that the tint reaches "<class>.min_saturation"
+// (HSV) at Saturation 100. The limit sits at slider 100 and the slider then
+// scales it like any tint, so the slider still turns every star up or down
+// evenly. Only the chroma grows: the hue stays the star's own.
+// Why (5 Nov, owner): B designer colours run from violet to a pale sky blue.
+// At slider 100 the pale ones came out at HSV saturation 0.29-0.55 while the
+// game's own light at them measured 0.56-0.82 (about 0.75 near the star), so
+// they looked duller than vanilla; the violet ones (0.70-0.86) were already
+// richer. A lower limit lifts the pale ones and leaves the violet ones alone,
+// where a plain "B.saturation" would have pushed both.
+inline float ClassSaturationFor(const std::string& cls, const Rgb& colour) {
+  const float* sat = FindByClass(class_saturation, cls);
+  const float base = sat != nullptr ? *sat : 1.f;
+  const float* min_sat = FindByClass(class_min_saturation, cls);
+  const float mx = std::max({colour.r, colour.g, colour.b}), mn = std::min({colour.r, colour.g, colour.b});
+  // clamped: float rounding can put a grey's luma one ulp outside [mn, mx]
+  const float y = std::clamp(Luma(colour), mn, mx);
+  // Saturate(colour, s) moves each channel linearly away from y and keeps their
+  // order, so its HSV saturation is 1 - (y + (mn - y) s) / (y + (mx - y) s);
+  // solved for the s that gives min_sat. Grey or near-grey has no hue to raise:
+  // a rounding-level spread would be amplified into a huge multiplier.
+  if (min_sat == nullptr || !(y > 0.f) || !(mx - mn > 1e-4f * mx)) return base;
+  const float den = (1.f - *min_sat) * (mx - y) + (y - mn);
+  return std::max(base, *min_sat * y / den / kNaturalChroma);
 }
 
 // The star's colour for "Star Colour" mode. The default is the star's own
@@ -720,7 +752,7 @@ inline void UpdateApplied(LightState& l, uint64_t arrival) {
   if (goal_ptr != nullptr && Luma(*goal_ptr) > 0.f) goal = Chromaticity(*goal_ptr);
   else if (l.base_valid && Luma(l.base_colour) > 0.f) goal = Chromaticity(l.base_colour);
   else return;
-  const float goal_sat = LookupClassSaturation(PolicyClass(l));
+  const float goal_sat = ClassSaturationFor(PolicyClass(l), goal);
 
   if (l.applied_valid && l.applied_identity != l.signature) {
     // another star: a hand-over if the previous one was applied a moment
@@ -773,7 +805,8 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
     class_sat = l.applied_sat;
   } else if (l.known) {
     target = GoalColour(l, star);
-    class_sat = LookupClassSaturation(PolicyClass(l));
+    // as UpdateApplied: a vanilla goal is the light's own colour
+    class_sat = ClassSaturationFor(PolicyClass(l), target != nullptr ? *target : l.base_valid ? l.base_colour : in);
   }
   Rgb out = in;
   if (target != nullptr && Luma(*target) > 0.f) {
@@ -797,6 +830,7 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
 // Defined further down (journal teacher); used by the experiment's journal thread.
 inline std::filesystem::path JournalDir();
 inline std::string JsonField(const std::string& line, const char* key);
+inline double JsonNumber(const std::string& line, const char* key, double fallback = 0.0);
 }  // namespace elitedangerous::starlight
 #include "./starlight_experiment.hpp"
 namespace elitedangerous::starlight {
@@ -1338,8 +1372,10 @@ inline bool OnStarDraw(reshade::api::command_list* cmd_list, uint32_t crc) {
           fm.fx_any[k] = true, fm.fx_sig[k] = sig, fm.fx_cos[k] = c;
         }
         // The surface draw tells where the star is on screen and which target
-        // it is drawn into: sample the rendered colour there at present.
-        if (star.fx == StarFx::Surface && sc[3] > 0.f && bit->second.rt0.handle != 0u) {
+        // it is drawn into: sample the rendered colour there at present. Not
+        // while the scanner is open: a star drawn near a light the scanner hold
+        // keeps on its star may be another one (measured policies)
+        if (star.fx == StarFx::Surface && sc[3] > 0.f && bit->second.rt0.handle != 0u && !scanner_open) {
           const float nx = sc[0] / sc[3], ny = sc[1] / sc[3];
           if (std::abs(nx) < 0.95f && std::abs(ny) < 0.95f)
             probe[i] = {true, bit->second.rt0, {nx, ny}, frame_index, reinterpret_cast<uint64_t>(cmd_list),
@@ -1400,19 +1436,43 @@ inline void EndFrame() {
     }
   }
 
+  // after the scanner closed, the view is the cockpit's again: each light's
+  // next lit frame takes its direction as it is (see the scanner hold below)
+  static bool scanner_was_open = false;
+  static std::array<bool, 2> retake_dir{};
+  if (scanner_was_open && !scanner_open) retake_dir = {true, true};
+  scanner_was_open = scanner_open;
+
   for (int i = 0; i < 2; ++i) {
     LightState& l = lights[i];
     const bool active = latest_gvd_valid
                         && Luma({latest_gvd.colour[i][0], latest_gvd.colour[i][1], latest_gvd.colour[i][2]}) > 0.f;
-    bool jumped = false;
+    bool jumped = false, scanner_hold = false;
     if (active) {
       const float* d = latest_gvd.dir[i];
       const float dot = l.dir[0] * d[0] + l.dir[1] * d[1] + l.dir[2] * d[2];
       // a sudden jump in direction = a different star (jump, binary swap);
       // also checked when the light comes back after being dark
-      jumped = l.known && dot < std::cos(3.f * 3.14159265f / 180.f);
-      if (jumped && !frame_match[i].any) l.known = false;
-      std::memcpy(l.dir, d, sizeof(l.dir));
+      jumped = l.known && !retake_dir[i] && dot < std::cos(3.f * 3.14159265f / 180.f);
+      retake_dir[i] = false;
+      // Scanner hold: zoomed in on a body, the Full Spectrum System Scanner
+      // lights it from that body's side, where no star is drawn (CSI+46-20087,
+      // 5 Nov: light 0 swung 70 to 165 degrees off its star for each zoom, the
+      // star was lost and the body lit in the game's own colour). While the
+      // scanner is open a known light keeps its star, its tint and the
+      // direction it had before the scanner (frozen even for small steps, so a
+      // zoom that swings the light over several frames is caught too). On the
+      // light's first lit frame after the scanner closes, the direction is
+      // taken as it is, not checked
+      // for a jump: the ship keeps flying while scanning (supercruise), so the
+      // star may have moved more than 3 degrees from the frozen direction by
+      // then, and if it is not drawn that frame the jump would drop it. Once
+      // more than 3 degrees off while open, a star drawn in
+      // the zoomed view does not take over (the owner's choice: no tint change
+      // at all, even for a body that orbits another star).
+      scanner_hold = jumped && scanner_open;
+      if (jumped && !scanner_open && !frame_match[i].any) l.known = false;
+      if (!(scanner_open && l.known)) std::memcpy(l.dir, d, sizeof(l.dir));
       l.game_colour = {latest_gvd.colour[i][0], latest_gvd.colour[i][1], latest_gvd.colour[i][2]};
       l.frames_inactive = 0;
     } else if (++l.frames_inactive > kForgetAfterFrames) {
@@ -1422,7 +1482,9 @@ inline void EndFrame() {
 
     if (!l.known) ResetMeasurement(l);  // a new star: measure afresh
     const FrameMatch& fm = frame_match[i];
-    if (fm.any) {
+    // held by the scanner: a match is another star's, so it neither takes over
+    // nor learns this star's class
+    if (fm.any && !scanner_hold) {
       const std::string sig = SignatureKey(fm.fx, fm.sig_colour);
       // A worse-ranked draw (the corona billboard while the surface is briefly
       // unmatched) must not replace a better identity of the same star: its
@@ -1462,7 +1524,9 @@ inline void EndFrame() {
       // may be another star's
       for (size_t k = 0; !keep_current && k < fm.fx_any.size() && l.known && !l.l_corona; ++k)
         if (fm.fx_any[k] && IsLDwarfCorona(static_cast<StarFx>(k), fm.fx_sig[k])) l.l_corona = true;
-    } else {
+    } else if (!scanner_hold) {
+      // not counted while held: a long scan would otherwise let a corona-only
+      // match at scanner close replace the surface identity (kIdentityHold)
       ++l.frames_since_match;
     }
   }
@@ -1512,6 +1576,7 @@ inline void EndFrame() {
         s << " policy=" << (pc.empty() ? "default (no exact match)" : pc) << (pc == "L" ? " (L corona)" : pc == "Y" ? " (Y/T band)" : "");
       }
     }
+    if (scanner_open) s << " | scanner open";
     s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
       << " patched=" << stat_list_patched << " matched/frame=" << stat_list_matched_frame;
     reshade::log::message(reshade::log::level::info, s.str().c_str());
@@ -1573,6 +1638,17 @@ inline std::string JsonField(const std::string& line, const char* key) {
   a += k.size();
   auto b = line.find('"', a);
   return b == std::string::npos ? std::string{} : line.substr(a, b - a);
+}
+
+inline double JsonNumber(const std::string& line, const char* key, double fallback) {
+  const std::string k = std::string("\"") + key + "\":";
+  const auto a = line.find(k);
+  if (a == std::string::npos) return fallback;
+  const char* p = line.c_str() + a + k.size();
+  while (*p == ' ') ++p;
+  char* end = nullptr;
+  const double v = std::strtod(p, &end);
+  return end == p ? fallback : v;
 }
 
 inline void JournalLoop() {
@@ -1642,7 +1718,23 @@ inline void JournalLoop() {
         reshade::log::message(reshade::log::level::warning, "starlight: journal reader error, pass skipped");
       }
     }
-    for (int i = 0; i < 10 && journal_run; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Status.json between journal passes, 4 times a second: is the scanner open
+    // (the scanner hold in EndFrame). The game rewrites the file in place, so a
+    // read without "Flags" and "GuiFocus" (half written, or the main menu)
+    // changes nothing: a missing GuiFocus read as 0 would end a hold mid-zoom.
+    for (int i = 0; i < 4 && journal_run; ++i) {
+      try {
+        // no Saved Games folder: no status (not a Status.json beside the game)
+        std::ifstream f(dir.empty() ? std::filesystem::path() : dir / "Status.json", std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (text.find("\"Flags\"") != std::string::npos && text.find("\"GuiFocus\":") != std::string::npos) {
+          StateLock lock;
+          scanner_open = JsonNumber(text, "GuiFocus") == 9.0;
+        }
+      } catch (...) {  // as above: an exception must not end the game
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
   }
 }
 
@@ -1873,9 +1965,17 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .default_value = 1.f,
           .label = "Starlight Colour",
           .section = "Starlight",
-          .tooltip = "Star Colour: tint each light with the colour of the star actually casting it.\n"
-                     "Class Table: use renodx-starlight.ini for stars whose class has been learned.",
-          .labels = {"Vanilla", "Star Colour", "Class Table"},
+          // Class Table (2) only in the dev build: its placeholder colours ended up
+          // looking much like vanilla (owner, 5 Nov). The regular build still
+          // reads renodx-starlight.ini, which Star Colour needs for its class
+          // rules. A saved 2 is capped to the last label on load (Setting::
+          // ReadFromConfig), so it comes back as Star Colour there.
+          .tooltip = experiment::kTestModeBuilt
+                         ? "Star Colour: tint each light with the colour of the star actually casting it.\n"
+                           "Class Table: use renodx-starlight.ini for stars whose class has been learned."
+                         : "Star Colour: tint each light with the colour of the star actually casting it.",
+          .labels = experiment::kTestModeBuilt ? std::vector<std::string>{"Vanilla", "Star Colour", "Class Table"}
+                                               : std::vector<std::string>{"Vanilla", "Star Colour"},
       },
 #if RENODX_STARLIGHT_TEST_MODE  // dev build only (starlight_experiment.hpp)
       new Setting{
@@ -1920,7 +2020,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
           .tooltip = "Chroma of the tint. 100 is the natural look; above it the colour gets heavy quickly.",
           .max = 200.f,
           .is_enabled = [] { return config.mode != 0.f; },
-          .parse = [](float v) { return v * 0.005f; },
+          .parse = [](float v) { return v * (kNaturalChroma / 100.f); },
       },
       new Setting{
           .key = "StarlightAutoLearn",
@@ -1989,7 +2089,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                   const float su = used != nullptr ? used->r + used->g + used->b : 1.f;
                   ImGui::Text("   policy for class %s (saturation x%.2f): %s%s%.3f %.3f %.3f",
                               PolicyClass(l).empty() ? "(unlearned)" : PolicyClass(l).c_str(),
-                              LookupClassSaturation(PolicyClass(l)),
+                              l.applied_valid ? l.applied_sat : ClassSaturationFor(PolicyClass(l), used != nullptr ? *used : l.game_colour),
                               src == StarSource::Measured ? "measured" : src == StarSource::Table ? "class table"
                               : src == StarSource::Vanilla ? "vanilla" : "constant",
                               used != nullptr ? ", using chroma " : " (light left as the game made it) ",
