@@ -45,12 +45,23 @@ Output
                                    display, SDR if it is off. The panel says
                                    what it found, and warns if the game ends
                                    up on a display set the other way.
-  HDR (RenoDX)                     RenoDX HDR.
-  SDR (vanilla image + Starlight)  the game's own SDR picture with only
-                                   Starlight added; the RenoDX tone-mapping
-                                   sliders then do nothing.
+  HDR (RenoDX)                     RenoDX HDR. Its Tone Mapper defaults to
+                                   RenoDX (Vanilla+); Custom and Vanilla
+                                   are one click away.
+  SDR                              the game's own SDR picture with Starlight
+                                   added. SDR has its own Tone Mapper
+                                   setting. Starlight AgX (the default) is
+                                   a fixed AgX look that keeps the game's
+                                   hues (matched in darktable UCS); Vanilla
+                                   is the game's own look; Vanilla+ and
+                                   Custom are RenoDX's own. All but Vanilla
+                                   tone map the scene before the game's SDR
+                                   clip, and the Color Grading sliders then
+                                   adjust from there (50 = as shipped).
   Restart the game after changing it. A choice saved by an earlier version
-  is kept; pick Auto to switch to it.
+  is kept; pick Auto to switch to it. HDR and SDR each keep their own
+  Tone Mapper choice. From v0.1.3 HDR starts on Vanilla+ once, also when
+  an earlier version saved Custom (that was its default).
 Starlight
   Starlight Colour  Star Colour (default) tints each light with its star.
                     Vanilla turns Starlight off (use it to compare: the
@@ -59,6 +70,11 @@ Starlight
                     (100 = all the way).
   Saturation        chroma of the starlight. 100 is the natural look;
                     higher gets heavy quickly.
+  Star Brightness   brightness of the star's disc, hotspot and edge
+                    (0-400, 100 = vanilla).
+  Glow Brightness   brightness of its corona glow and lens flares
+                    (0-400, 100 = vanilla). Neither changes the light the
+                    star casts.
   Learn classes on arrival
                     Keep on. After a hyperspace jump the arrival star's class
                     from the journal is attached to that star's colour, which
@@ -74,7 +90,10 @@ KNOWN LIMITS (beta)
   while it is open, even when you zoom into a body orbiting another star.
   The System Map does not do this yet.
 - A light whose star is not drawn (a far-away primary seen from a distant
-  companion) keeps roughly the game's own colour.
+  companion) keeps roughly the game's own colour. When the game switches
+  your light to such a star for a moment, the tint now fades to that
+  colour and back instead of snapping; the shadow still moves at once,
+  as the game draws it.
 - An L dwarf that is not in the signatures file is lit like an ordinary
   star. If it is a system's main star it is learned the first time you jump
   in; a companion L dwarf stays that way.
@@ -104,11 +123,19 @@ RenoDX Elite Dangerous mod: Musa Haji (mqhaji).
 RenoDX: Carlos Lopez Jr. (clshortfuse) and contributors,
 https://github.com/clshortfuse/renodx
 ReShade: crosire, https://reshade.me (not included).
-RenoDX, its Elite Dangerous mod and Starlight are released under the MIT
-License:
+AgX: "Minimal AgX" by Missing Deadlines (Benjamin Wrensch) and three.js, MIT.
+darktable UCS: Aurelien Pierre, darktable project,
+https://eng.aurelienpierre.com/2022/02/color-saturation-control-for-the-21th-century/
+RenoDX, its Elite Dangerous mod and Starlight, and the AgX and darktable UCS
+code they include, are released under the MIT License (darktable UCS with
+its addenda: credit as above, and the name "darktable UCS" in the UI):
 
   Copyright (c) 2025 Carlos Lopez Jr.
   Copyright (c) 2023-2026 Musa Haji
   Copyright (c) 2026 CMDR SaltyVet (Starlight)
+  Copyright (c) 2024 Missing Deadlines (Benjamin Wrensch) (AgX tone mapper,
+    "Minimal AgX"; values from Troy Sobotka's AgX)
+  Copyright (c) 2010-2026 three.js authors (AgX tone mapper, Blender-style)
+  Copyright 2022 Aurelien Pierre / darktable project (darktable UCS)
 
 __MIT__

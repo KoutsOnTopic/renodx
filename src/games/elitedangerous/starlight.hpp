@@ -266,6 +266,10 @@ struct LightState {
   // scaled down); recolouring relative to this base keeps that filtering.
   bool base_valid = false;
   Rgb base_colour;
+  // base_colour is (to drift tolerance) one real uploaded colour, not a
+  // per-channel mix of two different lights (a hand-over, a jump arrival):
+  // only then are copies compared with it as atmosphere filters (FilteredChannel)
+  bool base_pure = false;
   // The tint actually applied (chromaticity, sum 1) and its class saturation.
   // On a hand-over inside a system it rolls over from the previous star's
   // values over kRolloverSeconds; on arrival it switches at once.
@@ -280,9 +284,21 @@ struct LightState {
   uint64_t applied_frame = 0;    // last frame the goal was computed
   uint64_t applied_arrival = 0;  // arrival_seq at that time
   std::chrono::steady_clock::time_point applied_time{};  // and when (kHoldSeconds)
-  // Star lost a moment ago (kHoldSeconds): the tint above stays applied and a
-  // roll-over in progress is paused, not cancelled.
+  Rgb applied_goal;              // the goal of that frame: a step in it rolls over too
+  float applied_goal_sat = 1.f;
+  // Star lost in this system: the tint above stays applied. For kHoldSeconds
+  // it is kept as it is and a roll-over in progress is paused, not cancelled;
+  // after that it fades to the light's own colour (fading) and then follows it.
   bool holding = false;
+  bool fading = false;
+  // last frame the tint was held or faded without a star: the flags above and
+  // `applied` describe what is on screen only if this is recent
+  uint64_t lost_frame = 0;
+  // Lost while the picture cut to another scene (scene_cut: a map, a hyperspace
+  // jump): there is nothing to fade from, so the tint follows at once, and so
+  // does a star found within kHoldSeconds of the last such frame (cut_time).
+  bool cut = false;
+  std::chrono::steady_clock::time_point cut_time{};
 };
 
 struct FrameMatch {
@@ -383,10 +399,20 @@ inline uint32_t frame_gvd_uploads = 0;
 
 struct ColourKey {
   uint32_t w[3];  // float bits of an original light colour
+  // Uploaded with a light direction away from last frame's (kJumpCos): another
+  // star's light, so LightState::base_colour does not describe it. Not part of
+  // the key's identity.
+  bool jumped = false;
   bool operator==(const ColourKey& o) const { return w[0] == o.w[0] && w[1] == o.w[1] && w[2] == o.w[2]; }
 };
+// A light direction more than 3 degrees from last frame's is a different star
+// (a jump, a binary swap), not the same star moving.
+inline const float kJumpCos = std::cos(3.f * 3.14159265f / 180.f);
 constexpr size_t kMaxKeysPerLight = 16;
 inline std::array<std::vector<ColourKey>, 2> frame_keys, prev_keys;  // per light
+// Per light: component-wise maximum of this frame's flagged (ColourKey::jumped)
+// colours so far, i.e. the new star's unattenuated light as far as uploaded.
+inline std::array<Rgb, 2> jump_base{};
 inline uint32_t stat_gvd_per_frame = 0, stat_variants[2] = {0, 0};
 // A light that goes dark (night side, eclipse, hangar) keeps its identity as
 // long as its direction stays continuous; forgotten only after this long.
@@ -448,6 +474,19 @@ constexpr std::chrono::seconds kMinJumpSeconds{10};
 // Status.json GuiFocus 9: the Full Spectrum System Scanner is open (journal
 // thread, under the lock; read by the scanner hold in EndFrame)
 inline bool scanner_open = false;
+// GuiFocus 6 to 8: Galaxy Map, System Map or Orrery, each with a light of its
+// own (same thread and lock; read by UpdateApplied)
+inline bool map_open = false;
+// Between a hyperspace StartJump and its FSDJump as the journal thread reads
+// them (same lock): the old system, the tunnel, then the arrival star, which
+// can be matched up to a second before FSDJump is read.
+inline bool hyperspace_jump = false;
+// Probe log: one line per change of a light's tint state (star, held, fading,
+// rolling), so a swap that lasts a few frames is on record; the 1 Hz probe
+// line never caught one (9 Nov).
+constexpr uint32_t kTransitionLogCap = 4000;
+inline uint32_t transition_lines = 0;
+inline std::array<std::string, 2> transition_state;
 inline std::atomic_bool journal_run = false;
 inline std::thread journal_thread;
 
@@ -730,68 +769,200 @@ inline Rgb Chromaticity(const Rgb& c) {
   return sum > 0.f ? Rgb{c.r / sum, c.g / sum, c.b / sum} : Rgb{1.f / 3, 1.f / 3, 1.f / 3};
 }
 
+// A goal that moves by more than this (chromaticity or saturation) between two
+// frames is a step, not drift, and rolls over like a change of star.
+constexpr float kGoalStep = 0.01f;
+
 // Once per frame (EndFrame, lock held): computes the goal and rolls the
 // applied tint towards it. A goal of "vanilla" is the light's own
 // chromaticity, so a class set to vanilla blends in and out like any other.
+// Inside a system the tint never steps: a change of star, a change of goal,
+// losing the star and finding one again all roll over from what is on screen.
+// It switches at once only where the picture itself cuts: the first star, an
+// arrival (another arrival_seq), a map or a hyperspace jump (LightState::cut),
+// and a light that was dark for longer than a hand-over.
 inline void UpdateApplied(LightState& l, uint64_t arrival) {
   const auto now = std::chrono::steady_clock::now();
+  const auto start_roll = [&] {
+    l.roll_from = l.applied;
+    l.roll_from_sat = l.applied_sat;
+    l.roll_start = now;
+    l.rolling = true;
+  };
+  // moves the applied tint along the running roll-over, or straight to the goal without one
+  const auto roll_towards = [&](const Rgb& goal, float goal_sat) {
+    float t = 1.f;
+    if (l.rolling) {
+      t = std::chrono::duration<float>(now - l.roll_start).count() / kRolloverSeconds;
+    }
+    if (t >= 1.f) {
+      l.rolling = false;
+      l.applied = goal;
+      l.applied_sat = goal_sat;
+      return;
+    }
+    t = t * t * (3.f - 2.f * t);  // ease in and out
+    l.applied = Chromaticity({l.roll_from.r + (goal.r - l.roll_from.r) * t, l.roll_from.g + (goal.g - l.roll_from.g) * t,
+                              l.roll_from.b + (goal.b - l.roll_from.b) * t});
+    l.applied_sat = l.roll_from_sat + (goal_sat - l.roll_from_sat) * t;
+  };
+  const auto stepped = [&](const Rgb& goal, float goal_sat) {
+    return std::abs(goal.r - l.applied_goal.r) > kGoalStep || std::abs(goal.g - l.applied_goal.g) > kGoalStep
+           || std::abs(goal.b - l.applied_goal.b) > kGoalStep || std::abs(goal_sat - l.applied_goal_sat) > kGoalStep;
+  };
+  const bool has_own = l.base_valid && Luma(l.base_colour) > 0.f;
+
   if (!l.known || config.mode == 0.f) {
-    // star lost a moment ago in the same system: keep the tint (kHoldSeconds)
-    l.holding = config.mode != 0.f && l.applied_valid && arrival == l.applied_arrival
-                && now - l.applied_time < kHoldSeconds;
-    if (!l.holding) l.rolling = false;
+    // Only a tint that was on screen last frame is carried on: after Mode was
+    // off, or in the test mode's view while that mode was not selected, the
+    // saved tint may be minutes old and must not come back on a starless light.
+    const bool on_screen = frame_index - std::max(l.applied_frame, l.lost_frame) <= 1;
+    // dark for longer than a hand-over (a hyperspace tunnel): nothing to keep continuous
+    if (config.mode == 0.f || !l.applied_valid || arrival != l.applied_arrival || !on_screen || !has_own
+        || l.frames_inactive > kHandoverGapFrames) {
+      l.holding = l.rolling = l.fading = l.cut = false;
+      return;
+    }
+    l.holding = true;
+    l.lost_frame = frame_index;
+    // The cut covers the other scene and the moment after it (Status.json and
+    // the journal lag the picture): a star found later, in flight, rolls in.
+    if (map_open || hyperspace_jump) {
+      l.cut = true;
+      l.cut_time = now;
+    } else if (l.cut && now - l.cut_time > kHoldSeconds) {
+      l.cut = false;
+    }
+    // star lost a moment ago: keep the tint as it is, a roll-over stays paused
+    if (!l.fading && now - l.applied_time < kHoldSeconds) return;
+    // Lost for longer: fade to the light's own colour instead of dropping the
+    // tint in one frame (Qiedia WD-A d1-0, 9 Nov: the game moved light 0 to
+    // another star for a moment and the ground snapped between two colours).
+    // Once faded, the tint keeps following the light: a star coming back rolls
+    // in from exactly what is on screen, and copies stay patched the same way.
+    // The light moving on to yet another star is a step of its own colour and
+    // rolls as well.
+    const Rgb own = Chromaticity(l.base_colour);
+    if (!l.fading || stepped(own, 1.f)) {
+      l.fading = true;
+      start_roll();
+    }
+    l.applied_goal = own;
+    l.applied_goal_sat = 1.f;
+    if (l.cut) {
+      l.rolling = false;
+    }
+    roll_towards(own, 1.f);
     return;
   }
-  // bounded again here: the test mode's view is not updated while that mode is
-  // not selected, so a flag saved then may be minutes old when it comes back
-  const bool was_holding = l.holding && now - l.applied_time < kHoldSeconds;
-  l.holding = false;
+  // by frames: the test mode's view is not updated while that mode is not
+  // selected, so a flag saved then may be minutes old when it comes back
+  const bool was_lost = l.holding && frame_index - l.lost_frame <= 1;
+  const bool was_holding = was_lost && !l.fading;
+  const bool was_fading = was_lost && l.fading;
+  const bool cut = was_lost && l.cut;
+  l.holding = l.fading = l.cut = false;
   Rgb tmp;
   const Rgb* goal_ptr = GoalColour(l, tmp);
   Rgb goal;
-  if (goal_ptr != nullptr && Luma(*goal_ptr) > 0.f) goal = Chromaticity(*goal_ptr);
-  else if (l.base_valid && Luma(l.base_colour) > 0.f) goal = Chromaticity(l.base_colour);
-  else return;
+  if (goal_ptr != nullptr && Luma(*goal_ptr) > 0.f) {
+    goal = Chromaticity(*goal_ptr);
+  } else if (has_own) {
+    goal = Chromaticity(l.base_colour);
+  } else {
+    return;
+  }
   const float goal_sat = ClassSaturationFor(PolicyClass(l), goal);
 
-  if (l.applied_valid && l.applied_identity != l.signature) {
-    // another star: a hand-over if the previous one was applied a moment
-    // ago (or its tint is still held) in the same system, otherwise (arrival
-    // after a jump) switch at once
-    const bool handover = (was_holding || frame_index - l.applied_frame < kHandoverGapFrames)
-                          && arrival == l.applied_arrival;
-    if (handover) {
-      l.roll_from = l.applied;
-      l.roll_from_sat = l.applied_sat;
-      l.roll_start = now;
-      l.rolling = true;
+  const bool recent = frame_index - l.applied_frame < kHandoverGapFrames;
+  const bool same_star = l.applied_identity == l.signature;
+  // An arrival only matters for a tint that is not this star's already: the
+  // journal is read up to a second late, and a bump for the star applied last
+  // frame must not cut its running roll-over.
+  const bool arrived = arrival != l.applied_arrival && (was_fading || !same_star);
+  if (!l.applied_valid || cut || arrived) {
+    l.rolling = false;  // nothing on screen to be continuous with: switch at once
+  } else if (was_fading) {
+    start_roll();  // back from a faded tint, whichever star it is
+  } else if (!same_star) {
+    // another star: a hand-over if the previous one was applied a moment ago
+    // (or its tint is still held), otherwise switch at once
+    if (was_holding || recent) {
+      start_roll();
     } else {
       l.rolling = false;
     }
+  } else if (recent && stepped(goal, goal_sat)) {
+    start_roll();  // the same star with another goal (its class or policy changed)
   } else if (was_holding && l.rolling) {
     l.roll_start += now - l.applied_time;  // the same star back: resume the paused roll-over
   }
-  if (!l.applied_valid) l.rolling = false;
   l.applied_identity = l.signature;
   l.applied_frame = frame_index;
   l.applied_arrival = arrival;
   l.applied_time = now;
-
-  float t = 1.f;
-  if (l.rolling) {
-    t = std::chrono::duration<float>(now - l.roll_start).count() / kRolloverSeconds;
-    if (t >= 1.f) t = 1.f, l.rolling = false;
-    t = t * t * (3.f - 2.f * t);  // ease in and out
-  }
-  l.applied = l.rolling ? Chromaticity({l.roll_from.r + (goal.r - l.roll_from.r) * t, l.roll_from.g + (goal.g - l.roll_from.g) * t,
-                                        l.roll_from.b + (goal.b - l.roll_from.b) * t})
-                        : goal;
-  l.applied_sat = l.rolling ? l.roll_from_sat + (goal_sat - l.roll_from_sat) * t : goal_sat;
+  l.applied_goal = goal;
+  l.applied_goal_sat = goal_sat;
+  roll_towards(goal, goal_sat);
   l.applied_valid = true;
 }
 
+// True when c is the unattenuated light `base` filtered by an atmosphere. The
+// engine's transmittance keeps one channel bit-identical and lowers the others:
+// (806.313, 340.03, 276.406) of (806.313, 803.901, 770.74) on Phrio Hypa TJ-O
+// d7-0 4 (ammonia, 7 Nov scan), (129.4, 110.7, 114.3) of (129.4, 124.0, 119.9)
+// on 1 Nov; red was the kept channel both times. Returns the kept channel
+// (0..2), or -1 when c is not such a filter of base.
+// Tolerances: the base is built from the previous two frames while c is this
+// frame's, and in flight the light drifts by a few float steps per second
+// (419.675 -> 419.649 over a minute, 7 Nov) or ramps in brightness, so the
+// kept channel is compared to kKeptTolerance (0.1 % a frame), not
+// bit-exactly: a frame where it ticked must not fall back to the old formula
+// (that flickered in review). A filter must lower another channel by more
+// than kLoweredMin (1 %), so a copy equal to the base or a uniformly dimmer
+// light never passes and keeps the old formula; a filter weaker than 1 % looks
+// the same either way (the two formulas differ by under 0.5 % there). A
+// different light only passes with one channel matching to 0.1 %, and a mixed
+// base (hand-over) is excluded by LightState::base_pure.
+inline float Channel(const Rgb& c, int k) { return k == 0 ? c.r : k == 1 ? c.g : c.b; }
+constexpr float kKeptTolerance = 1e-3f;
+constexpr float kLoweredMin = 1e-2f;
+// The test works on the shape of c / base per channel: the kept channel is the
+// highest ratio, within `tolerance` of 1; another must be lower than it by
+// more than kLoweredMin. The base hold uses kKeptTolerance; the carry-over in
+// RemapLight uses the wider kCarryBand, because the base it is compared with
+// is up to two frames old and the light may ramp: a ramp of 3 %/s, or one
+// long frame during a slower one, moved the kept channel past 0.1 % and
+// flipped the ground between the two formulas (re-review, 8 Nov). The
+// carried result follows a ramp by itself (in / base), so the wider band
+// keeps it continuous.
+constexpr float kCarryBand = 5e-2f;
+inline int FilteredChannel(const Rgb& c, const Rgb& base, float tolerance = kKeptTolerance) {
+  const float cv[3] = {c.r, c.g, c.b}, bv[3] = {base.r, base.g, base.b};
+  float ratio[3];
+  for (int k = 0; k < 3; ++k) {
+    if (!(bv[k] > 0.f)) return -1;
+    ratio[k] = cv[k] / bv[k];
+  }
+  const int kept = ratio[0] >= ratio[1] && ratio[0] >= ratio[2] ? 0 : ratio[1] >= ratio[2] ? 1 : 2;
+  if (!(std::abs(ratio[kept] - 1.f) <= tolerance)) return -1;
+  const float lowest = std::min({ratio[0], ratio[1], ratio[2]});
+  return lowest < ratio[kept] * (1.f - kLoweredMin) ? kept : -1;
+}
+inline uint32_t stat_filtered_copies = 0;  // probe log: copies recoloured with their atmosphere filter carried over
+inline uint32_t stat_base_held[2] = {0, 0};  // probe log: frames whose base was kept over filtered-only variants, per light
+inline float stat_sky_colour[3] = {0, 0, 0};  // probe log: sky light (GlobalViewData 416) of the brightest upload, original
+
 // Chroma comes from the chosen source; luminance stays exactly the game's.
-inline Rgb RemapLight(const LightState& l, const Rgb& in) {
+// carry_filter = false keeps the pre-7-Nov handling for a colour whose relation
+// to the light is not known (the sky light at GlobalViewData 416, never logged).
+// own_base: this frame's unattenuated light so far (jump_base), for a light
+// that jumped to another star this frame. l.base_colour is still the previous
+// star's then (it is built at the end of the frame), and recolouring against
+// it skewed colour and brightness for a frame or two at each swap. Known
+// limit: a filtered copy uploaded before the frame's first unfiltered one is
+// its own base and loses its filter for that frame.
+inline Rgb RemapLight(const LightState& l, const Rgb& in, bool carry_filter = true, const Rgb* own_base = nullptr) {
   const float y = Luma(in);
   if (!(y > 0.f) || config.mode == 0.f) return in;
 
@@ -808,22 +979,41 @@ inline Rgb RemapLight(const LightState& l, const Rgb& in) {
     // as UpdateApplied: a vanilla goal is the light's own colour
     class_sat = ClassSaturationFor(PolicyClass(l), target != nullptr ? *target : l.base_valid ? l.base_colour : in);
   }
-  Rgb out = in;
-  if (target != nullptr && Luma(*target) > 0.f) {
-    // Multiplicative recolouring: the per-channel gain that turns the light's
-    // unattenuated colour into the target chroma at unchanged luminance, then
-    // applied to this copy. A copy already filtered by the atmosphere keeps
-    // that filter on top of the new colour; outside an atmosphere base == in.
-    const Rgb base = l.base_valid ? l.base_colour : in;
-    const float yb = Luma(base), k = yb / Luma(*target), s = config.strength;
-    const float floor = 1e-6f * yb;  // a zero channel in the base cannot be scaled: keep it tiny
-    const Rgb gain{target->r * k / std::max(base.r, floor), target->g * k / std::max(base.g, floor),
-                   target->b * k / std::max(base.b, floor)};
-    out = {in.r + (in.r * gain.r - in.r) * s, in.g + (in.g * gain.g - in.g) * s, in.b + (in.b * gain.b - in.b) * s};
+  const Rgb base = (own_base != nullptr ? *own_base : l.base_valid ? l.base_colour : in);
+  // The finished colour for a copy x: recolour, then saturate. Recolouring is
+  // multiplicative: the per-channel gain that turns the light's unattenuated
+  // colour into the target chroma at unchanged luminance, applied to x.
+  auto finish = [&](const Rgb& x) {
+    Rgb out = x;
+    if (target != nullptr && Luma(*target) > 0.f) {
+      const float yb = Luma(base), k = yb / Luma(*target), s = config.strength;
+      const float floor = 1e-6f * yb;  // a zero channel in the base cannot be scaled: keep it tiny
+      const Rgb gain{target->r * k / std::max(base.r, floor), target->g * k / std::max(base.g, floor),
+                     target->b * k / std::max(base.b, floor)};
+      out = {x.r + (x.r * gain.r - x.r) * s, x.g + (x.g * gain.g - x.g) * s, x.b + (x.b * gain.b - x.b) * s};
+    }
+    // the class's own chroma multiplier ("Y.saturation = 1.5": the game's Y dwarf
+    // light has the right hue, only bland) on top of the global slider
+    return Saturate(out, config.saturation * class_sat);
+  };
+  // A copy filtered by an atmosphere: finish the unattenuated light, then put
+  // this copy's filter (in / base per channel) back on top, exactly as the
+  // game applied it. Saturating the filtered copy itself scaled the
+  // atmosphere's tint by the slider too: halved at Saturation 100, so the
+  // ground on Phrio Hypa TJ-O d7-0 4 went from red/green 2.37 (vanilla) to 1.62
+  // (owner, 7 Nov). Only for a light with a star (or a held tint), so an
+  // unidentified light, a mixed base (hand-over) and every copy that is not
+  // such a filter (outside an atmosphere in == base) keep exactly the old result.
+  if (carry_filter && (own_base != nullptr || (l.base_valid && l.base_pure)) && (l.known || l.holding)
+      && FilteredChannel(in, base, kCarryBand) >= 0) {
+    ++stat_filtered_copies;
+    const Rgb want = finish(base);
+    // FilteredChannel checked every base channel > 0; a bit-equal channel keeps want exactly,
+    // and a ramp since the base was built carries over as part of in / base
+    auto carry = [](float w, float i, float b) { return i == b ? w : w * (i / b); };
+    return {carry(want.r, in.r, base.r), carry(want.g, in.g, base.g), carry(want.b, in.b, base.b)};
   }
-  // the class's own chroma multiplier ("Y.saturation = 1.5": the game's Y dwarf
-  // light has the right hue, only bland) on top of the global slider
-  return Saturate(out, config.saturation * class_sat);
+  return finish(in);
 }
 
 // ---- experimental detection (separate file, selectable) -----------------------
@@ -867,12 +1057,30 @@ inline void OnGvdData(BufferShadow& sh, uint8_t* base) {
 
   // brightest upload of the frame defines the lights (see latest_gvd)
   float luma = 0.f;
+  bool jumped[2];  // this upload's light points away from last frame's: another star's light
   for (int i = 0; i < 2; ++i) {
     Rgb c{g.colour[i][0], g.colour[i][1], g.colour[i][2]};
     const float y = Luma(c);
     luma += y;
+    const LightState& l = lights[i];
+    // base_valid, not active: a light back from a dark frame on another star counts too
+    jumped[i] = l.base_valid && l.dir[0] * g.dir[i][0] + l.dir[1] * g.dir[i][1] + l.dir[2] * g.dir[i][2] < kJumpCos;
+    // A colour the current pure base explains (equal to drift, or an atmosphere
+    // filter of it) is the same light whatever its direction did: a map or the
+    // scanner moves it, and the Galaxy Map uploads only the filtered copy, which
+    // must keep the base held (see the base rebuild in EndFrame).
+    if (jumped[i] && l.base_pure
+        && (FilteredChannel(c, l.base_colour) >= 0
+            || (std::abs(c.r - l.base_colour.r) <= l.base_colour.r * kKeptTolerance
+                && std::abs(c.g - l.base_colour.g) <= l.base_colour.g * kKeptTolerance
+                && std::abs(c.b - l.base_colour.b) <= l.base_colour.b * kKeptTolerance))) {
+      jumped[i] = false;
+    }
+    if (jumped[i]) {
+      jump_base[i] = {std::max(jump_base[i].r, c.r), std::max(jump_base[i].g, c.g), std::max(jump_base[i].b, c.b)};
+    }
     if (y > 0.f) {
-      ColourKey key;
+      ColourKey key{.jumped = jumped[i]};
       std::memcpy(key.w, g.colour[i], sizeof(key.w));
       auto& keys = frame_keys[i];
       if (keys.size() < kMaxKeysPerLight && std::find(keys.begin(), keys.end(), key) == keys.end()) keys.push_back(key);
@@ -882,23 +1090,28 @@ inline void OnGvdData(BufferShadow& sh, uint8_t* base) {
     latest_gvd = g;
     latest_gvd_valid = true;
     frame_gvd_luma = luma;
+    std::memcpy(stat_sky_colour, base + gvd::kAtmosphereLightColour, sizeof(stat_sky_colour));  // original, for the probe log
   }
 
   if (config.mode == 0.f) return;
   for (int i = 0; i < 2; ++i) {
     Rgb in{g.colour[i][0], g.colour[i][1], g.colour[i][2]};
     if (!(Luma(in) > 0.f)) continue;
-    Rgb out = RemapLight(experiment::ActiveLight(i), in);
+    Rgb out = RemapLight(experiment::ActiveLight(i), in, /*carry_filter=*/true, jumped[i] ? &jump_base[i] : nullptr);
     float* dst = reinterpret_cast<float*>(base + gvd::kLightColour + 16 * i);
     float v[3] = {out.r, out.g, out.b};
     std::memcpy(dst, v, sizeof(v));
   }
-  // planet sky colour follows light 1
+  // planet sky colour follows light 1 (index 0). Its relation to the light's
+  // base is unknown (never logged before 7 Nov; the probe line now shows it),
+  // so it keeps the old handling until a landing shows whether it is a
+  // filtered copy too.
   float atmo[3];
   std::memcpy(atmo, base + gvd::kAtmosphereLightColour, sizeof(atmo));
   Rgb a{atmo[0], atmo[1], atmo[2]};
   if (Finite(atmo, 3) && a.r >= 0 && a.g >= 0 && a.b >= 0 && Luma(a) > 0.f) {
-    Rgb out = RemapLight(experiment::ActiveLight(0), a);
+    Rgb out = RemapLight(experiment::ActiveLight(0), a, /*carry_filter=*/false,
+                         jumped[0] && Luma(jump_base[0]) > 0.f ? &jump_base[0] : nullptr);
     float v[3] = {out.r, out.g, out.b};
     std::memcpy(base + gvd::kAtmosphereLightColour, v, sizeof(v));
   }
@@ -971,8 +1184,9 @@ inline bool ScanBuffer(uint64_t handle, const AnyBuffer& info, uint8_t* base, ui
     const LightState& al = experiment::ActiveLight(i);
     if (!al.known && !al.holding && !scanning) continue;
     keys[i] = frame_keys[i];
+    // last frame's colours are the light the state was built from, whatever they were flagged then
     for (const auto& k : prev_keys[i])
-      if (std::find(keys[i].begin(), keys[i].end(), k) == keys[i].end()) keys[i].push_back(k);
+      if (std::find(keys[i].begin(), keys[i].end(), k) == keys[i].end()) keys[i].push_back({.w = {k.w[0], k.w[1], k.w[2]}});
     any_key = any_key || !keys[i].empty();
   }
   if (!any_key) return false;
@@ -983,14 +1197,16 @@ inline bool ScanBuffer(uint64_t handle, const AnyBuffer& info, uint8_t* base, ui
     ColourKey w;
     std::memcpy(w.w, local.data() + off, sizeof(w.w));
     for (int i = 0; i < 2; ++i) {
-      if (std::find(keys[i].begin(), keys[i].end(), w) == keys[i].end()) continue;
+      const auto key = std::find(keys[i].begin(), keys[i].end(), w);
+      if (key == keys[i].end()) continue;
       if (scanning) LogScanHit('C', i, handle, info, path, off, local.data(), size);
       hot_kinds.insert({info.size, info.usage});
       ++stat_list_matched_frame;
       if (config.mode == 0.f) break;
       float orig[3];
       std::memcpy(orig, w.w, sizeof(orig));
-      Rgb out = RemapLight(experiment::ActiveLight(i), {orig[0], orig[1], orig[2]});
+      const Rgb in{orig[0], orig[1], orig[2]};
+      Rgb out = RemapLight(experiment::ActiveLight(i), in, /*carry_filter=*/true, key->jumped ? &jump_base[i] : nullptr);
       float v[3] = {out.r, out.g, out.b};
       std::memcpy(base + off, v, sizeof(v));
       ++stat_list_patched;
@@ -1453,7 +1669,7 @@ inline void EndFrame() {
       const float dot = l.dir[0] * d[0] + l.dir[1] * d[1] + l.dir[2] * d[2];
       // a sudden jump in direction = a different star (jump, binary swap);
       // also checked when the light comes back after being dark
-      jumped = l.known && !retake_dir[i] && dot < std::cos(3.f * 3.14159265f / 180.f);
+      jumped = l.known && !retake_dir[i] && dot < kJumpCos;
       retake_dir[i] = false;
       // Scanner hold: zoomed in on a body, the Full Spectrum System Scanner
       // lights it from that body's side, where no star is drawn (CSI+46-20087,
@@ -1537,6 +1753,24 @@ inline void EndFrame() {
   experiment::selected_flag = experiment::Selected();
   for (auto& l : lights) UpdateApplied(l, arrival_seq);
 
+  for (int i = 0; i < 2 && config.probe_log != 0.f && transition_lines < kTransitionLogCap; ++i) {
+    const LightState& l = experiment::ActiveLight(i);
+    std::string state = l.known ? l.signature : "no star";
+    if (l.holding) state += l.fading ? " (tint fading)" : " (tint held)";
+    if (l.rolling) state += " rolling";
+    if (state == transition_state[i]) continue;
+    transition_state[i] = state;
+    ++transition_lines;
+    std::stringstream s;
+    s << "starlight tint: frame " << frame_index << " L" << i << " " << state << " | dir=(" << l.dir[0] << "," << l.dir[1] << ","
+      << l.dir[2] << ") col=(" << l.game_colour.r << "," << l.game_colour.g << "," << l.game_colour.b << ")";
+    if (l.applied_valid) s << " tint=(" << l.applied.r << "," << l.applied.g << "," << l.applied.b << ")";
+    if (l.base_valid) s << " base=(" << l.base_colour.r << "," << l.base_colour.g << "," << l.base_colour.b << ")" << (l.base_pure ? "" : " mixed");
+    s << " variants=" << frame_keys[i].size() << " matched=" << frame_match[i].any << (map_open ? " map" : "")
+      << (hyperspace_jump ? " hyperspace" : "");
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
+
   // Teacher: just after arriving, light 0 is the arrival star.
   if (config.auto_learn != 0.f && arrival_seq != arrival_seq_used && !arrival_class.empty()) {
     if (arrival_frame == 0) arrival_frame = frame_index;
@@ -1570,7 +1804,7 @@ inline void EndFrame() {
         << " variants=" << frame_keys[i].size();
       if (!l.active) s << " dark=" << l.frames_inactive;
       if (l.known) s << " star=" << FxName(l.source) << " " << l.signature << " class=" << l.cls;
-      else if (l.holding) s << " holding tint";
+      else if (l.holding) s << (l.fading ? " tint faded" : " holding tint");
       if (l.known && PolicyClass(l) != l.cls) {
         const std::string pc = PolicyClass(l);
         s << " policy=" << (pc.empty() ? "default (no exact match)" : pc) << (pc == "L" ? " (L corona)" : pc == "Y" ? " (Y/T band)" : "");
@@ -1579,6 +1813,18 @@ inline void EndFrame() {
     if (scanner_open) s << " | scanner open";
     s << " | gvd/frame=" << frame_gvd_uploads << " colour copies: kinds=" << hot_kinds.size()
       << " patched=" << stat_list_patched << " matched/frame=" << stat_list_matched_frame;
+    // atmosphere handling (7 Nov): light 0's unattenuated base, the sky light at
+    // 416 (original) and whether it is a filtered copy of that base, copies
+    // recoloured with their filter carried over, frames the base was held
+    const Rgb sky{stat_sky_colour[0], stat_sky_colour[1], stat_sky_colour[2]};
+    s << " | atmo: base0=";
+    if (lights[0].base_valid) s << "(" << lights[0].base_colour.r << "," << lights[0].base_colour.g << "," << lights[0].base_colour.b << ")";
+    else s << "none";
+    if (frame_gvd_uploads > 0) s << " sky=(" << sky.r << "," << sky.g << "," << sky.b << ")";  // this frame's, not a stale one
+    else s << " sky=none";
+    s << (frame_gvd_uploads > 0 && lights[0].base_valid && FilteredChannel(sky, lights[0].base_colour, kCarryBand) >= 0 ? " sky-filtered" : "")
+      << (lights[0].base_valid && !lights[0].base_pure ? " base-mixed" : "") << " filtered=" << stat_filtered_copies
+      << " held=" << stat_base_held[0];
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
 
@@ -1588,25 +1834,59 @@ inline void EndFrame() {
   for (int i = 0; i < 2; ++i) stat_variants[i] = static_cast<uint32_t>(frame_keys[i].size());
   // unattenuated light colour = component-wise max of this frame's and last frame's variants
   for (int i = 0; i < 2; ++i) {
-    Rgb mx{0, 0, 0};
-    bool any = false;
-    for (const auto* set : {&frame_keys[i], &prev_keys[i]})
+    // The light jumped to another star this frame: last frame's variants are the
+    // previous star's and stay out, or the base would be a mix of two lights for
+    // a frame (wrong gain, and no filter carry-over while it is not pure).
+    const bool jumped = !frame_keys[i].empty()
+                        && std::all_of(frame_keys[i].begin(), frame_keys[i].end(), [](const ColourKey& k) { return k.jumped; });
+    std::vector<Rgb> variants;
+    for (const auto* set : {&frame_keys[i], &prev_keys[i]}) {
+      if (jumped && set == &prev_keys[i]) continue;
       for (const ColourKey& k : *set) {
         float c[3];
         std::memcpy(c, k.w, sizeof(c));
-        mx = {std::max(mx.r, c[0]), std::max(mx.g, c[1]), std::max(mx.b, c[2])};
-        any = true;
+        variants.push_back({c[0], c[1], c[2]});
       }
-    if (any) {
-      lights[i].base_colour = mx;
-      lights[i].base_valid = true;
     }
+    if (variants.empty()) continue;
+    LightState& l = lights[i];
+    // Only filtered variants in both frames (the Galaxy Map on an atmospheric
+    // world uploads just the filtered light: 7 Nov log, 23:17:54): keep the
+    // unattenuated base, scaled with the kept channel so it follows the light's
+    // drift. Rebuilt from them, the base would be the filtered colour, every
+    // copy would lose its filter, and the first frame after the map (the base
+    // lags a frame) would light the ship cyan-white. Only from a pure base: a
+    // per-channel mix of two lights (hand-over) has every later colour as a
+    // "filter" of it and would be held for good (review, 8 Nov).
+    bool hold = l.base_valid && l.base_pure && !jumped;
+    float scale = 0.f;
+    for (const Rgb& v : variants) {
+      if (!hold) break;
+      const int k = FilteredChannel(v, l.base_colour);
+      if (k < 0) hold = false;
+      else scale = std::max(scale, Channel(v, k) / Channel(l.base_colour, k));
+    }
+    if (hold) {
+      ++stat_base_held[i];
+      if (scale != 1.f) l.base_colour = {l.base_colour.r * scale, l.base_colour.g * scale, l.base_colour.b * scale};
+    } else {
+      Rgb mx{0, 0, 0};
+      for (const Rgb& v : variants) mx = {std::max(mx.r, v.r), std::max(mx.g, v.g), std::max(mx.b, v.b)};
+      l.base_colour = mx;
+      // pure: the max is (to drift) one of the variants, so no other light mixed in
+      auto within = [](float a, float b) { return std::abs(a - b) <= std::max(a, b) * kKeptTolerance; };
+      l.base_pure = std::any_of(variants.begin(), variants.end(),
+                                [&](const Rgb& v) { return within(v.r, mx.r) && within(v.g, mx.g) && within(v.b, mx.b); });
+    }
+    l.base_valid = true;
   }
   if (experiment::Selected())  // test mode: its view uses this frame's unattenuated colour too
     for (int i = 0; i < 2; ++i)
-      experiment::view[i].base_valid = lights[i].base_valid, experiment::view[i].base_colour = lights[i].base_colour;
+      experiment::view[i].base_valid = lights[i].base_valid, experiment::view[i].base_colour = lights[i].base_colour,
+      experiment::view[i].base_pure = lights[i].base_pure;
   prev_keys = std::move(frame_keys);
   for (auto& k : frame_keys) k.clear();
+  jump_base = {};
   frame_gvd_uploads = 0;
   frame_gvd_luma = -1.f;  // next frame picks its own brightest upload
   discovery_budget = (frame_index % light_list::kDiscoveryPeriod == 0) ? light_list::kDiscoveryBytes : 0;
@@ -1697,10 +1977,12 @@ inline void JournalLoop() {
             pending = JsonField(line, "StarClass");
             StateLock lock;
             jump_start_time = std::chrono::steady_clock::now();
+            hyperspace_jump = !pending.empty();  // FSDJump clears it only with a class pending
           } else if (line.find("\"event\":\"FSDJump\"") != std::string::npos && !pending.empty()) {
             StateLock lock;
             arrival_class = pending;
             ++arrival_seq;
+            hyperspace_jump = false;
             arrival_frame = 0;
             pending.clear();
           }
@@ -1729,7 +2011,9 @@ inline void JournalLoop() {
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         if (text.find("\"Flags\"") != std::string::npos && text.find("\"GuiFocus\":") != std::string::npos) {
           StateLock lock;
-          scanner_open = JsonNumber(text, "GuiFocus") == 9.0;
+          const double gui_focus = JsonNumber(text, "GuiFocus");
+          scanner_open = gui_focus == 9.0;
+          map_open = gui_focus >= 6.0 && gui_focus <= 8.0;
         }
       } catch (...) {  // as above: an exception must not end the game
       }
@@ -2085,7 +2369,7 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                   ImGui::Text("   seen on screen: chroma %.3f %.3f %.3f  sat %.2f hue %.0f  (%u samples, %u of last %u used)",
                               l.measured_acc.r / s, l.measured_acc.g / s, l.measured_acc.b / s,
                               Saturation(l.measured_acc), Hue(l.measured_acc), l.measured_samples, l.measured_used, l.ring_count);
-                  if (l.rolling) ImGui::Text("   rolling over from the previous star");
+                  if (l.rolling) ImGui::TextUnformatted("   tint rolling over");
                   const float su = used != nullptr ? used->r + used->g + used->b : 1.f;
                   ImGui::Text("   policy for class %s (saturation x%.2f): %s%s%.3f %.3f %.3f",
                               PolicyClass(l).empty() ? "(unlearned)" : PolicyClass(l).c_str(),
@@ -2099,7 +2383,8 @@ inline std::vector<renodx::utils::settings::Setting*> Settings() {
                   ImGui::TextUnformatted("   seen on screen: not measured yet (using the star's constant)");
                 }
               } else if (l.holding) {
-                ImGui::TextUnformatted("   star lost for a moment: keeping its tint");
+                ImGui::TextUnformatted(l.fading ? "   star lost: its tint fades to the light's own colour"
+                                                : "   star lost for a moment: keeping its tint");
               } else {
                 ImGui::TextUnformatted("   star not identified yet (look towards it)");
               }

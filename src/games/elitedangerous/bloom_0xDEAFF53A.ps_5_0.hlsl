@@ -52,7 +52,9 @@ void main(
   o0.xyz = r0.xyz * float3(0.125, 0.125, 0.125) + r1.xyz;
   o0.w = 0;
 
-  o0.rgb *= CUSTOM_BLOOM;
+  // SDR Vanilla is the unmodded image, and the Bloom slider is greyed out
+  // there; HDR keeps its existing behaviour
+  if (RENODX_OUTPUT_SDR == 0.f || RENODX_TONE_MAP_TYPE != 0.f) o0.rgb *= CUSTOM_BLOOM;
 
   return;
 }

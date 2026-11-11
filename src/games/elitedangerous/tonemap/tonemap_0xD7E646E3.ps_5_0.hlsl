@@ -101,8 +101,8 @@ void main(
 
   r1.rgb = ApplyLUT(r1.rgb, t0, s0_s, cb2[0].x, cb2[11].x);
 
-  r1.xyz = (r1.xyz * cb2[10].yyy + cb2[9].yyy);   // remove saturate
-  r1.w = renodx::color::yf::from::BT709(r1.xyz);  //  r1.w = dot(r1.xyz, float3(0.308600008, 0.609399974, 0.0820000023));
+  r1.xyz = ApplyVanillaSdrClamp(r1.xyz * cb2[10].yyy + cb2[9].yyy);  // remove saturate (kept for SDR Vanilla)
+  r1.w = VanillaSaturationLuma(r1.xyz);  //  r1.w = dot(r1.xyz, float3(0.308600008, 0.609399974, 0.0820000023));
   r1.xyz = r1.xyz + -r1.www;
   r1.xyz = cb2[10].zzz * r1.xyz + r1.www;
 

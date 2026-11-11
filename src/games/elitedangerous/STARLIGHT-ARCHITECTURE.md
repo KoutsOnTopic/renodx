@@ -231,6 +231,36 @@ class propagation spreads such a class only from an exact match.
 - Even so, brown dwarfs are now `vanilla` (§4) because the game already has
   their hue; measurement remains available for classes that want it.
 
+### Star and Glow Brightness (experiment, 9 Nov; not committed yet)
+
+Owner: brighten "the star itself (not the light it's outputting)", tunable.
+Two sliders in the Starlight section, 0-400%, 100 = vanilla, HDR and SDR,
+whatever the Starlight Colour mode: **Star Brightness** scales the disc
+(StarOpaqueNoise, both variants), hotspot and edge draws; **Glow Brightness**
+the corona (both variants) and lens flares (both variants). The eight
+`kStarShaders` pixel shaders are replaced (`star/*.hlsl`, decompiled with
+3Dmigoto's cmd_Decompiler) with one change each, `o0.rgb *= STAR_BRIGHTNESS`
+or `GLOW_BRIGHTNESS` before the return. Six came from the old DevKit dump;
+the corona and flare `_1` variants were never dumped and were taken from
+`Effects*_Win64_SM50.arc` (raw deflate after a 16-byte header, as
+`ed_starlight_layout.py` reads it), each matched by its CRC32. Recompiled, the
+eight match the originals' instructions except for scheduling (fxc merges the
+flare's two `sincos`). `StarlightObserveShader` now carries `.code`: the
+generated `__ALL_CUSTOM_SHADERS` lists the same CRCs, and the first entry for
+a CRC wins. At 0% the draw is skipped (the observer's `on_draw` returns
+false after `OnStarDraw` has seen it, `StarDrawFactor`), because only rgb is
+scaled: a draw blended by its alpha would otherwise paint black. Identification
+is unaffected, since the draw was observed first.
+
+Why the light cannot change: lights are read from GlobalViewData (and its
+copies), and stars are identified from the draws' constant buffers (b0
+matrix, b2 colours), never from their pixels. The one consumer of the drawn
+pixels is the measurement above, which only `measured` class policies use
+(none shipped). With such a policy the sliders would matter: different
+Star and Glow factors shift the measured mix of disc and glow colours, and a
+star dimmed far below 100% can fall under the 0.015 peak gate. More bloom
+around a brighter star is expected: bloom is made from the drawn scene.
+
 ## 6. Recolouring (`RemapLight`)
 
 - **Chroma only, luminance kept.** Brightness is the game's.
@@ -240,6 +270,48 @@ class propagation spreads such a class only from an exact match.
   Reason: inside an atmosphere some copies already carry transmittance;
   replacing their chroma erased the reddening the vanilla light showed.
   Outside an atmosphere base == copy, so nothing changes there.
+- **The atmosphere's filter is carried over after saturating**
+  (`FilteredChannel`, `RemapLight`). A copy that keeps one channel of the
+  base and lowers another by more than 1 % is that light filtered by an
+  atmosphere (the engine keeps one channel bit-identical; red in both cases
+  seen: Phrio Hypa TJ-O d7-0 4 on 7 Nov, a 1 Nov landing). The kept channel
+  is compared to 0.1 %, not bit-exactly, because the base lags a frame and
+  the light drifts or ramps; an exact test fell back to the old formula on
+  every drift step (review: 1-2 frame flicker). For such a copy of a light
+  with a star and a pure base, the base is recoloured and saturated, then
+  multiplied by copy / base per channel, so the filter is exactly the game's. Reason: saturating the filtered copy
+  itself scaled the atmosphere's tint by the slider too: halved at
+  Saturation 100 (ground red/green 2.37 vanilla, 1.62 Starlight, 2.39 now),
+  exaggerated for classes above ×1 (brown dwarfs). Every other copy (outside
+  atmospheres, unidentified lights, a dimmer or different light) keeps the
+  old formula bit for bit. The sky light at GlobalViewData 416 keeps the old
+  handling (`carry_filter = false`) until the probe log shows how it relates
+  to the base.
+- **The base is held over filtered-only frames.** When every variant of
+  both frames is a filtered copy of the current base (the Galaxy Map on an
+  atmospheric world uploads just that), the base is kept, scaled with the
+  kept channel so it follows drift. Rebuilt from them, the base would be the
+  filtered colour and the first frame after the map (the base lags a frame)
+  would light the ship cyan-white.
+- **Pure base** (`LightState::base_pure`): the per-channel max is (to 0.1 %)
+  one real variant. During a hand-over it is a mix of two lights, of which
+  the new light looks like a "filter"; neither the carry-over nor the hold
+  applies then (review: a hold locked in the mixed tint for good), so those
+  frames keep the old formula.
+- **A light that jumps to another star** (`ColourKey::jumped`, `kJumpCos`,
+  `jump_base`). Patching runs during the frame with the state built at the
+  end of the previous one, so on the first frame of a swap `base_colour` is
+  still the previous star's: the gain was wrong for one or two frames and the
+  carry-over misjudged (9 Nov review of the Qiedia WD-A d1-0 flicker). An
+  upload whose light direction is more than 3 degrees from last frame's is
+  flagged, unless the pure base explains its colour (equal, or a filtered copy
+  of it: a map or the scanner moving the same light; the Galaxy Map's
+  filtered-only uploads must keep the base held). Flagged uploads and copies
+  are recoloured against `jump_base`, the per-channel maximum of the frame's
+  flagged colours so far (`RemapLight`'s `own_base`), with the filter carried
+  over against it. When every variant of the frame is flagged, the base is
+  rebuilt from this frame alone and not held. Known limit: a filtered copy
+  uploaded before the frame's first unfiltered one loses its filter that frame.
 - **Copies are matched against every colour variant** seen this frame and
   last (`frame_keys`/`prev_keys`), not the latest upload. Reason: two
   variants exist per frame near planets; matching only one left the terrain
@@ -267,28 +339,49 @@ class propagation spreads such a class only from an exact match.
 ## 7. Hand-overs (`UpdateApplied`)
 
 Each frame computes the light's goal tint (chromaticity + class saturation;
-"vanilla" is the light's own chromaticity) and keeps the applied one. When
-the identified star changes and the previous one was applied <
-`kHandoverGapFrames` ago with the same `arrival_seq` (no jump), the tint
-eases from old to new over `kRolloverSeconds` (2.5 s wall clock, smoothstep).
-Otherwise it switches at once, so arrivals have no delay. Reason: in-system
-hand-overs were jarring; jumps must not be.
+"vanilla" is the light's own chromaticity) and keeps the applied one.
 
-**Star lost for a moment: the tint is held.** A light whose identity drops
-keeps its applied tint for `kHoldSeconds` (0.5 s wall clock) in the same
-`arrival_seq` (`LightState::holding`): `RemapLight` keeps using `applied`,
-`ScanBuffer` keeps patching its copies, and a roll-over in progress pauses
-(`roll_start` is moved on by the gap when the same star returns). A different
-star found during the hold is a hand-over from the held tint. Reason: the game
-sometimes points a light between two stars for a few frames (HIP 21776, light 0
-8-32 degrees off the T dwarf towards the B, colour mixed to match; about 3
-frames in flight, up to about 0.37 s at System Map close). No star is drawn
-there, the identity dropped, and the light flashed the game's own colour
-(`Saturate(in, config.saturation)` on GlobalViewData, i.e. slider x 0.005,
-x0.5 at 100; raw on the ship/station copies),
-pale and near-neutral next to the tints. The owner saw it as a flicker. Side
-effect, the owner's choice: on opening the System Map its own light keeps the
-star's tint for up to 0.5 s.
+**Rule: inside a system the tint never steps.** Every change eases from what
+is on screen over `kRolloverSeconds` (2.5 s wall clock, smoothstep), starting
+at once, so nothing is delayed:
+
+| Event | What happens |
+|---|---|
+| Another star identified, previous one applied < `kHandoverGapFrames` ago or still held | roll from the applied tint |
+| Same star, goal moved by more than `kGoalStep` since last frame (class or policy changed; `applied_goal`) | roll |
+| Star lost | held as it is for `kHoldSeconds` (0.5 s), a running roll paused (`holding`) |
+| Still lost after the hold | fades to the light's own chromaticity (`fading`), then follows it; `holding` stays set |
+| Star found after a fade | rolls in from the faded value |
+| The faded light moves to another unidentified light | rolls to that light's own chromaticity |
+
+It switches at once only where the picture itself cuts: the first star, an
+arrival (another `arrival_seq`, unless the tint is already this star's: the
+journal is read up to a second late), a light dark for longer than
+`kHandoverGapFrames` (the tunnel), and a scene cut (`LightState::cut`). A cut
+is a lost frame while `map_open` (GuiFocus 6-8) or `hyperspace_jump`
+(StartJump read, FSDJump not yet); it lasts `kHoldSeconds` past the last such
+frame, because Status.json and the journal lag the picture. During a cut the
+tint follows the light at once, as before the fade existed, and a star found
+then is applied at once.
+
+Reason for the fade (9 Nov, Qiedia WD-A d1-0): the game moved light 0 to
+another star for a moment. Before, the tint was dropped in one frame when the
+hold ended and put back in one frame on return (same signature, so no roll),
+and a star found between 0.5 s and `kHandoverGapFrames` rolled from a tint no
+longer on screen. The owner saw the ground snap between two colours.
+
+While `holding` (held, fading or faded) `RemapLight` keeps using `applied` and
+`ScanBuffer` keeps patching copies, so GlobalViewData and copies change
+together. A faded tint equals the unidentified result on GlobalViewData
+(`Saturate(in, slider)`); copies of a never-identified light stay raw, as
+before. `lost_frame` stamps every lost frame: a hold or fade not updated last
+frame is stale (Mode was off, or the test mode's view was not selected) and is
+dropped rather than revived.
+
+Reason for the hold: the game sometimes points a light between two stars for
+a few frames (HIP 21776, light 0 8-32 degrees off the T dwarf towards the B,
+colour mixed to match; about 3 frames in flight, up to about 0.37 s at System
+Map close). No star is drawn there and the identity drops.
 
 **Scanner hold.** Zoomed in on a body, the Full Spectrum System Scanner
 lights it from that body's side: light 0 swung 70–165° away from its star
@@ -323,8 +416,14 @@ aborted the process. Readback work runs between short locked sections.
 
 - **Probe log** (every 120 frames): uploads, rejected uploads, star draws per
   kind, per light direction/colour/best cos/variants/identity/class, copies
-  patched, `scanner open` while the scanner is open (§7). First thing to read
-  for any report.
+  patched, `scanner open` while the scanner is open (§7), and `atmo:` (light
+  0's base, the original sky light at 416 with `sky-filtered` when it is a
+  filtered copy of the base, copies recoloured with their filter carried over,
+  frames the base was held; §6). First thing to read for any report.
+- **`starlight tint:`** (probe log on): one line whenever a light's tint
+  state changes (star, tint held, tint fading, rolling), with direction, game
+  colour, applied tint, base and whether a star matched. Per frame, so a swap
+  of a few frames is on record; capped at `kTransitionLogCap` lines.
 - **`starlight star:`** once per distinct star constant block: c0..c3, the
   game light, bound textures.
 - **`starlight readback:`** per accepted/dropped sample (30 per star, then 1
@@ -354,6 +453,12 @@ Debugging a crash: `cdb -z <dump>` from `%LOCALAPPDATA%\CrashDumps` with
   help: the test mode found them zero in every valid upload of a 35-jump
   session (2 Nov 2026), including about 5 minutes under a dim, unnamed
   light in HIP 28711.
+- Test mode: a star restored from memory by direction (`Recall`) has its
+  entry's direction and frame refreshed while the light stays on it (9 Nov).
+  Before, the entry aged out `kRestoreFrames` after the last star draw and a
+  star out of view lost its tint about 8 s after any unmatched swap. The
+  default detection has no such memory: after an unmatched swap its light
+  stays unidentified (tint faded, §7) until the star is drawn again.
 - The System Map has its own directional light (seen as light 0 while the
   map is open). It is correctly left unidentified.
 - For the first second after a jump, light 0's class can come from a
@@ -443,8 +548,8 @@ cmake --build build.dev --config Release --target elitedangerous
 ```
 
 **Output setting** (`OutputMode`, addon.cpp, global): 0 = HDR (RenoDX
-swapchain, tone mapping, upgrades), 1 = SDR (the game's own image, Starlight
-only), 2 = Auto, the default. 0 and 1 predate Auto, so a saved choice keeps
+swapchain, tone mapping, upgrades), 1 = SDR (the game's own 8-bit image), 2 =
+Auto, the default. 0 and 1 predate Auto, so a saved choice keeps
 its meaning. Which one runs is decided once in DllMain, because it decides
 what gets hooked. Auto reads Windows' HDR switch there for the display the
 game window is on (main display if no window is found): ReShade loads add-ons
@@ -455,6 +560,112 @@ gives HDR, the output before Auto existed. If the swap chain later turns out
 to be on a display whose switch reads the other way from Auto's reading
 (checked whatever the setting, so switching to Auto mid-session shows it), the
 panel asks the player to pick HDR or SDR by hand.
+
+**SDR tone mappers** (experimental, 5 Nov). The owner finds vanilla SDR flat
+(low midtone contrast, dull colour). SDR now replaces the same game shaders as
+HDR (tone map, bloom, final copy, video: `sdr_shaders`), but with no swap
+chain proxy and no resource upgrades, so the image stays the game's 8-bit one.
+`shader_injection.output_sdr` (set once in DllMain) tells the shaders: the
+tone mapper is the SDR session's own setting (`SDRToneMapper` since the menu
+was cut, default position 1 = Starlight AgX since v0.1.3, kept apart from HDR's `HDRToneMapper` (default 1 = RenoDX Vanilla+ since v0.1.3; the old key `ToneMapType`, default Custom, is no longer read) so each output keeps its choice;
+`RENODX_TONE_MAP_TYPE` in shared.h picks), the peak is game white
+(`PeakRatio`), PsychoV targets BT.709, the result is clipped to 0..1, and the
+final copy and video shaders skip the HDR white scaling (the video keeps the
+game's gamma). SDR Vanilla restores the game's clamp after its
+brightness/contrast step (`ApplyVanillaSdrClamp`; the HDR shaders dropped it,
+"remove saturate"), so it should be the unmodded image; that is still to be
+confirmed in game against the v0.1.2 release build, which hooked nothing in SDR.
+Tone mappers 3 (RenoDRT) and 4 (ACES) are offered in SDR only, through
+`renodx::tonemap::config::Apply`, with the input scaled so the game curve's
+inflection (0.119 -> 0.164) sits at their mid gray and comes out at the game's
+level. Peak, Game and UI Brightness are hidden in SDR.
+
+**AgX** (SDR tone mappers 5-8, `tonemap/agx.hlsli`): Base, Punchy and Golden
+from "Minimal AgX" (Missing Deadlines / Benjamin Wrensch, MIT, values from
+Troy Sobotka's AgX), and a Blender-style variant (Rec.2020 primaries) from
+three.js (MIT). Both notices are in the file and the copyright lines in the
+release README, since the zip ships compiled copies. Licences were checked on
+5 Nov: Sobotka's and Eary Chow's AgX repos have no licence and Blender's
+config is GPL, so nothing was taken from them; the RoboCop and Control AgX code
+in this repo models those games' shaders, so it was not used either. All four
+use the 7th-order curve fit. Golden keeps the Minimal AgX post's saturation
+0.8 (Sobotka's original and Filament use 1.3: `AGX_GOLDEN_SATURATION`). Each
+variant gets an exposure (`AGX_EXPOSURE`, solved offline) that puts the game
+curve's inflection at the game's output level; Punchy needs about 2x, since its
+look darkens mid gray. The Highlights/Shadows/Contrast/Saturation sliders
+apply before AgX at mid gray 0.18.
+
+**SDR menu after testing** (owner, 5 Nov): Vanilla, AgX Punchy, Vanilla+,
+Custom, in every build (AgX Punchy became Starlight AgX in v0.1.3, see
+below). ACES, RenoDRT and AgX Base/Golden/Blender-style are
+hidden; their code stays (a label plus a `kTypeAt` entry brings one back). The
+setting key became `SDRToneMapper` because saved menu positions would
+otherwise point at different tone mappers. Until v0.1.3 AgX Punchy had these
+controls of its own (now fixed values, see Starlight AgX below): **AgX Gamma** (AgX's display gamma, 1.8-2.6,
+2.2 as published), **sRGB Shadow Correction** (0-100%: blends the final
+gamma-2.2 encode toward the sRGB encode, so a monitor that decodes with the
+sRGB curve, whose linear toe lifts the darkest tones, shows gamma 2.2; the
+curves meet near mid gray and differ by under 1% above it), and **Hue
+Shift** (100% = AgX as published; lower moves the OkLab hue toward the game
+curve's result for the same light, keeping AgX's lightness and chroma, over
+the whole image). The owner found AgX turned bright oranges (the ship
+hologram's outline, a carbon star) red next to the game. Measured: the game's
+per-channel curve pushes bright oranges toward yellow (a star orange of hue
+22 deg at twice mid-white: 46 deg through the game's curve, 34 through AgX
+Punchy). A first version restored the light's own pre-tone-map hue and
+weighted by luminance; that hue is redder still and saturated oranges never
+reach high luminance, so it barely did anything (key `AgXHighlightHueShift`,
+replaced by `AgXHueShift`). At 0 the oranges land within 1 deg of the game's
+hue; greys stay neutral. **Hue Space** (`AgXHueSpace`, 6 Nov) picks the space
+the blend works in: OkLab (default, Ottosson, public domain or MIT), ICtCp
+(BT.2100), IPT (Ebner and Fairchild; `HueIPT` in tonemap.hlsli, the library
+has none) or darktable UCS (Aurélien Pierre, MIT with addenda: the UI must say
+"darktable UCS", and the author, project and URL are credited in the code and
+release README). All are RenoDX's own code. The blend fades out below 2% HSV
+saturation of either colour: where the game's curve clips a bright light to
+pure white there is no hue to take (OkLab followed rounding noise there), and
+darktable UCS divides by zero on grey and black. PsychoV37, asked for on 6 Nov,
+is not public yet (upstream has up to test30; the mod's Custom is a custom
+test31).
+
+**AgX Grading** (AgX Punchy only, section "AgX Grading" until v0.1.3, now fixed
+values; `ApplyAgXGrade`):
+Shadows, Midtones, Highlights (brightness), a tint and hue per zone, Contrast
+and Contrast Pivot; every slider's 50 is "no change", so the owner's dialed-in
+look stays the default. It runs after AgX and the Hue Shift, on the gamma-2.2
+encoded picture: the Hue Shift re-takes the game's hues and would overwrite a
+tint applied earlier. All maths is float, so the game's 8-bit write is the
+only rounding (no added banding). Brightness moves the encoded level through
+degree-4 Bernstein weights (peaks at levels 0.25 / 0.5 / 0.75) as a ratio of
+all channels, so hue is kept; contrast is a power curve either side of the
+pivot (50 = the game's mid-grey, level 0.4396). Black and white stay fixed for
+every setting and the curve stays rising at every slider extreme (checked
+offline, scratch agx_grade_check.py); tints are pure chroma offsets through the
+same weights, so black and white stay neutral. The general Color Grading
+sliders still work, before AgX.
+
+**Starlight AgX** (v0.1.3, owner, 9 Nov: "have it be the default look, and
+hide the sliders, it would be too bloated"). The AgX controls above are no
+longer settings: menu position 1 (shader type 6, formerly "AgX Punchy") is
+now "Starlight AgX" with the owner's tuning fixed as `#define`s in shared.h
+(`AGX_*`; the `agx_*` cbuffer fields are gone). The values are the owner's
+preset put through the old slider parse functions, so the picture is the
+same: Gamma 2.6, sRGB Shadow Correction 0, Hue Shift 0 in darktable UCS,
+Shadows 31, Midtones 63, Highlights 67, Contrast 53, Pivot 0, no tints. The
+owner's general Color Grading Contrast 46 and Saturation 54 became factors
+(`STARLIGHT_AGX_CONTRAST` 0.92, `STARLIGHT_AGX_SATURATION` 1.08) on those
+sliders for type 6 only, so their default 50 is the owner's picture and
+people adjust from there. To retune, change the defines; to bring sliders
+back, the parse maps are in the defines' comment. It is the SDR default
+(`SDRToneMapper` default 1); that key is new in v0.1.3, so every SDR install
+starts on it. Old `AgX*` keys in ReShade.ini are simply no longer read.
+Licences: the darktable UCS addendum asks that any implementation be called
+"darktable UCS" in the user interface. Starlight AgX implements it even
+though no setting names a colour space any more, so the RenoDX tab shows
+"Hues matched in darktable UCS." under Tone Mapping while Starlight AgX is
+picked, and the Tone Mapper tooltip says so. The other addendum (author,
+project and URL) is about reusing the code: dtucs.hlsl and the release README
+carry it, with the copyright line (owner, 9 Nov: no wall of text in the UI).
 
 From Git Bash, prefix the configure with `MSYS_NO_PATHCONV=1`, or the `/D`
 flags are rewritten into paths. The addon's file version is the time of the

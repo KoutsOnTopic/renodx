@@ -3,6 +3,16 @@
 
 #include "./shared.h"
 
+// Brightest scene output relative to game white: the user's peak in HDR. In
+// SDR the game's 8-bit image ends at its white, and the HDR brightness sliders
+// are hidden, so 1.
+float PeakRatio() {
+  return RENODX_OUTPUT_SDR != 0.f ? 1.f : RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+}
+
+// The scaling below lines game white up with UI white for the HDR swap chain
+// proxy. SDR has no proxy and no brightness sliders: the image stays as the
+// game wrote it, only grain applies.
 float3 GameScaleAndGrain(float3 color, float2 screen_position) {
   color = renodx::color::gamma::DecodeSafe(color, 2.2f);
   color = renodx::effects::ApplyFilmGrain(
@@ -13,19 +23,20 @@ float3 GameScaleAndGrain(float3 color, float2 screen_position) {
       1.f);
 
 #if 1
-  if (RENODX_TONE_MAP_TYPE != 0.f) {
+  if (RENODX_TONE_MAP_TYPE != 0.f && RENODX_OUTPUT_SDR == 0.f) {
     color = renodx::color::bt2020::from::BT709(color);
-    color = min(color, RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS);
+    color = min(color, PeakRatio());
     color = renodx::color::bt709::from::BT2020(color);
   }
 #endif
 
-  color *= RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
+  if (RENODX_OUTPUT_SDR == 0.f) color *= RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
   color = renodx::color::gamma::EncodeSafe(color, 2.2f);
   return color;
 }
 
 float3 GameScale(float3 color) {
+  if (RENODX_OUTPUT_SDR != 0.f) return color;
   color = renodx::color::gamma::DecodeSafe(color, 2.2f);
   color *= RENODX_DIFFUSE_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS;
   color = renodx::color::gamma::EncodeSafe(color, 2.2f);

@@ -29,8 +29,8 @@ void main(
   r1.rgb = ApplyPreLUTToneMapAndGammaEncode(r1.rgb);
 
   r1.rgb = renodx::math::SignPow(r1.rgb, 2.2f);
-  r1.xyz = (r1.xyz * cb2[10].yyy + cb2[9].yyy);  // remove saturate
-  r1.w = renodx::color::yf::from::BT709(r1.xyz);  //  r1.w = dot(r1.xyz, float3(0.308600008, 0.609399974, 0.0820000023));
+  r1.xyz = ApplyVanillaSdrClamp(r1.xyz * cb2[10].yyy + cb2[9].yyy);  // remove saturate (kept for SDR Vanilla)
+  r1.w = VanillaSaturationLuma(r1.xyz);  //  r1.w = dot(r1.xyz, float3(0.308600008, 0.609399974, 0.0820000023));
   r1.xyz = r1.xyz + -r1.www;
   r1.xyz = cb2[10].zzz * r1.xyz + r1.www;
 

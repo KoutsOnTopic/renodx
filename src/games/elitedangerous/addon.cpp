@@ -83,14 +83,30 @@ thread_local uint64_t g_current_uav0 = 0;
       },                                                                                               \
   }
 
-// Star draws: no replacement, only observed to find which star casts each light
+// The factor a star draw is scaled by (star/*.hlsl, shared.h): the body
+// (disc, hotspot, edge) by Star Brightness, the corona and lens flares by
+// Glow Brightness.
+float StarDrawFactor(uint32_t crc) {
+  using elitedangerous::starlight::StarFx;
+  const StarFx fx = elitedangerous::starlight::kStarShaders.at(crc).fx;
+  return (fx == StarFx::Corona || fx == StarFx::Flare) ? shader_injection.glow_brightness
+                                                       : shader_injection.star_brightness;
+}
+
+// Star draws: observed to find which star casts each light, and replaced
+// (star/*.hlsl) only to scale the drawn star by Star/Glow Brightness. This
+// entry must carry the code: __ALL_CUSTOM_SHADERS also lists these CRCs, and
+// the first entry for a CRC wins (DefineCustomShaders / unordered_map).
 #define StarlightObserveShader(value)                                                    \
   {                                                                                      \
       value,                                                                             \
       {                                                                                  \
           .crc32 = value,                                                                \
+          .code = __##value,                                                             \
           .on_draw = [](reshade::api::command_list* cmd_list) {                          \
-            return elitedangerous::starlight::OnStarDraw(cmd_list, value);               \
+            const bool drawn = elitedangerous::starlight::OnStarDraw(cmd_list, value);   \
+            /* at 0% skip the draw: scaled to black it could cover what is behind */     \
+            return drawn && StarDrawFactor(value) > 0.f;                                 \
           },                                                                             \
       },                                                                                 \
   }
@@ -105,8 +121,12 @@ thread_local uint64_t g_current_uav0 = 0;
       StarlightObserveShader(0xA6457BFD), /* SunLensFlareBillboard */                    \
       StarlightObserveShader(0x82FC416E) /* SunEdgeBillboards */
 
-// SDR output: only observe the star draws, leave the game's image pipeline alone
-renodx::mods::shader::CustomShaders starlight_only_shaders = {STARLIGHT_OBSERVERS};
+// SDR output: the star draws, plus the game's own shaders replaced in place
+// (tone map, bloom, final copy, video) with no swap chain proxy and no resource
+// upgrades, so the image stays the game's 8-bit SDR one. With the SDR Tone
+// Mapper on Vanilla the replacements reproduce the game's image (shared.h
+// output_sdr); the other tone mappers work before the game's 8-bit clip.
+renodx::mods::shader::CustomShaders sdr_shaders = {STARLIGHT_OBSERVERS, __ALL_CUSTOM_SHADERS};
 
 renodx::mods::shader::CustomShaders custom_shaders = {
     STARLIGHT_OBSERVERS,
@@ -130,8 +150,8 @@ renodx::mods::shader::CustomShaders custom_shaders = {
 
     __ALL_CUSTOM_SHADERS};
 
-// Output setting: 0 = HDR (RenoDX swapchain + tone mapping), 1 = SDR (vanilla
-// image, Starlight only), 2 = Auto (the default: Windows' HDR switch for the
+// Output setting: 0 = HDR (RenoDX swapchain + tone mapping), 1 = SDR (the
+// game's SDR image, its own SDR tone mapper setting), 2 = Auto (the default: Windows' HDR switch for the
 // game's display, read at launch). 0 and 1 predate Auto, so a saved choice
 // keeps its meaning.
 float output_mode = 2.f;
@@ -141,6 +161,14 @@ std::string auto_reading;          // what Auto read, for the settings panel and
 bool auto_mismatch = false;        // the swap chain's display reads the other way (OnInitSwapchain)
 
 bool SdrSelected() { return output_mode == 2.f ? auto_sdr : output_mode == 1.f; }
+
+// The tone mapper this session uses (shared.h RENODX_TONE_MAP_TYPE): SDR and
+// HDR keep separate choices, so SDR can start on Vanilla while HDR stays on
+// its own default.
+float ToneMapType() { return output_sdr_at_start ? shader_injection.sdr_tone_map_type : shader_injection.tone_map_type; }
+
+// Starlight AgX (SDR tone mapper type 6, shared.h): shows its credit line
+bool StarlightAgXShown() { return output_sdr_at_start && ToneMapType() == 6.f; }
 
 // Auto: is Windows HDR on for the game's display? Asked in DllMain, because
 // what gets hooked depends on it. ReShade loads add-ons inside the game's first
@@ -178,14 +206,22 @@ std::optional<bool> ReadWindowsHdr(std::string* display) {
 
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
-        .key = "ToneMapType",
+        // RenoDX (Vanilla+) is the HDR default since v0.1.3 (owner, 11 Nov);
+        // up to v0.1.2 it was Custom under the key "ToneMapType". RenoDX
+        // writes every setting of a preset whenever one changes, so a saved
+        // "ToneMapType" cannot tell a deliberate Custom from the old default:
+        // the new key moves every HDR install to Vanilla+ once, and a choice
+        // made from then on is kept. SDR keeps its own key (SDRToneMapper).
+        .key = "HDRToneMapper",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f,
+        .default_value = 1.f,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
-        .tooltip = "Sets the tone mapper type",
+        .tooltip = "HDR tone mapper. Vanilla+ (the default) is the game's curve with a smooth roll-off;\n"
+                   "Custom is RenoDX's PsychoV; Vanilla is the game's own image.",
         .labels = {"Vanilla", "RenoDX (Vanilla+)", "RenoDX (Custom)"},
+        .is_visible = []() { return !output_sdr_at_start; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapPeakNits",
@@ -197,7 +233,8 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Sets the value of peak white in nits",
         .min = 48.f,
         .max = 10000.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() != 0; },
+        .is_visible = []() { return !output_sdr_at_start; },
         .is_logarithmic = true,
     },
     new renodx::utils::settings::Setting{
@@ -209,6 +246,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Sets the value of 100% white in nits",
         .min = 48.f,
         .max = 500.f,
+        .is_visible = []() { return !output_sdr_at_start; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapUINits",
@@ -219,6 +257,52 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Sets the brightness of UI and HUD elements in nits",
         .min = 48.f,
         .max = 500.f,
+        .is_visible = []() { return !output_sdr_at_start; },
+    },
+    // After the brightness settings: OnInitSwapchain sets settings[1] (Peak
+    // Brightness) by index.
+    new renodx::utils::settings::Setting{
+        // A new key: the menu was cut from nine entries to four (owner, 5 Nov),
+        // so positions saved under the old key "SDRToneMapType" would now point
+        // at different tone mappers; it is simply no longer read.
+        .key = "SDRToneMapper",
+        .binding = &shader_injection.sdr_tone_map_type,
+        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+        // Starlight AgX is the default (owner, 9 Nov, v0.1.3). The key is new
+        // in v0.1.3 (v0.1.2 had no SDR tone mapper), so every SDR install
+        // starts on it; Vanilla is one click away.
+        .default_value = 1.f,
+        .label = "Tone Mapper",
+        .section = "Tone Mapping",
+        .tooltip = "SDR tone mapper. Vanilla is the game's own image.\n"
+                   "The others tone map the scene before the game's SDR clip:\n"
+                   "Starlight AgX (the default: AgX with a fixed grade, the game's hues kept in darktable UCS),\n"
+                   "Vanilla+ (the game's curve with a smooth roll-off), Custom (PsychoV).\n"
+                   "Highlights, Shadows, Contrast and Saturation work with all but Vanilla;\n"
+                   "Highlight Saturation, Dechroma and Flare with Vanilla+ and Custom only.",
+        // Menu order (owner, 5 Nov): Vanilla, the SDR tone mapper, then the two
+        // HDR ones. ACES, RenoDRT and AgX Base/Golden/Blender-style (types 3, 4,
+        // 5, 7, 8) are hidden after testing; their shader code stays, so adding
+        // a label and a kTypeAt entry brings one back. The saved value is the
+        // menu position; parse maps it to the shader's type number (shared.h
+        // sdr_tone_map_type), so the shaders never renumber.
+        .labels = {"Vanilla", "Starlight AgX", "RenoDX (Vanilla+)", "RenoDX (Custom)"},
+        .parse = [](float position) {
+          static constexpr float kTypeAt[] = {0.f, 6.f, 1.f, 2.f};
+          return kTypeAt[std::clamp(static_cast<int>(position), 0, 3)];
+        },
+        .is_visible = []() { return output_sdr_at_start; },
+    },
+    // The darktable UCS licence (MIT with addenda, src/shaders/color/dtucs.hlsl)
+    // requires the colour space to be called "darktable UCS" in the user
+    // interface; Starlight AgX matches its hues in it, so the name is on screen
+    // while it is picked. The other addendum (author, project and URL) is about
+    // reusing the code, and is met in dtucs.hlsl and the release README.
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::TEXT,
+        .label = "Hues matched in darktable UCS.",
+        .section = "Tone Mapping",
+        .is_visible = StarlightAgXShown,
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapScaling",
@@ -229,7 +313,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Tone Mapping",
         .tooltip = "Luminance scales colors consistently while per-channel saturates and blows out sooner",
         .labels = {"Luminance", "Per Channel"},
-        .is_enabled = []() { return shader_injection.tone_map_type == 1.f; },
+        .is_enabled = []() { return ToneMapType() == 1.f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHighlights",
@@ -238,7 +322,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Highlights",
         .section = "Color Grading",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() != 0; },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
@@ -248,7 +332,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Shadows",
         .section = "Color Grading",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() != 0; },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
@@ -258,7 +342,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Contrast",
         .section = "Color Grading",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() != 0; },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
@@ -268,7 +352,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Saturation",
         .section = "Color Grading",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() != 0; },
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
@@ -279,7 +363,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .tooltip = "Adds or removes highlight color.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() == 1.f || ToneMapType() == 2.f; },  // Vanilla+ and Custom only
         .parse = [](float value) { return value * 0.02f; },
     },
     new renodx::utils::settings::Setting{
@@ -290,7 +374,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .tooltip = "Controls highlight desaturation due to overexposure.",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() == 1.f || ToneMapType() == 2.f; },  // Vanilla+ and Custom only
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
@@ -301,7 +385,7 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .tooltip = "Flare/Glare",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() == 1.f || ToneMapType() == 2.f; },  // Vanilla+ and Custom only
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
@@ -320,7 +404,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Bloom",
         .section = "Effects",
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type != 0; },
+        .is_enabled = []() { return ToneMapType() != 0; },
         .parse = [](float value) { return value * 0.01f; },
     },
     new renodx::utils::settings::Setting{
@@ -403,7 +487,8 @@ renodx::utils::settings::Settings settings = {
 };
 void OnPresetOff() {
   renodx::utils::settings::UpdateSettings({
-      {"ToneMapType", 0.f},
+      {"HDRToneMapper", 0.f},
+      {"SDRToneMapper", 0.f},
       {"ToneMapPeakNits", 203.f},
       {"ToneMapGameNits", 203.f},
       {"ToneMapUINits", 203.f},
@@ -418,6 +503,8 @@ void OnPresetOff() {
       {"ColorGradeLUTStrength", 100.f},
       {"FxBloom", 100.f},
       {"FxGrainStrength", 0.f},
+      {"StarBrightness", 100.f},
+      {"GlowBrightness", 100.f},
   });
 }
 
@@ -491,6 +578,39 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         // Output + Starlight panels go just before the Links section
         {
           auto extra = elitedangerous::starlight::Settings();
+          // Star and Glow Brightness sit with the Starlight settings, after
+          // Saturation. They bind to shader_injection, which lives here, so
+          // they are added here rather than in starlight.hpp.
+          {
+            auto after = std::find_if(extra.begin(), extra.end(), [](auto* s) { return s->key == "StarlightTintChroma"; });
+            if (after != extra.end()) {
+              ++after;
+            }
+            extra.insert(after, {
+                                    new renodx::utils::settings::Setting{
+                                        .key = "StarBrightness",
+                                        .binding = &shader_injection.star_brightness,
+                                        .default_value = 100.f,
+                                        .label = "Star Brightness",
+                                        .section = "Starlight",
+                                        .tooltip = "Brightness of the star itself: its disc, hotspot and edge.\n"
+                                                   "100 is vanilla. The light the star casts does not change.",
+                                        .max = 400.f,
+                                        .parse = [](float value) { return std::clamp(value, 0.f, 400.f) * 0.01f; },
+                                    },
+                                    new renodx::utils::settings::Setting{
+                                        .key = "GlowBrightness",
+                                        .binding = &shader_injection.glow_brightness,
+                                        .default_value = 100.f,
+                                        .label = "Glow Brightness",
+                                        .section = "Starlight",
+                                        .tooltip = "Brightness of the star's corona glow and lens flares.\n"
+                                                   "100 is vanilla. The light the star casts does not change.",
+                                        .max = 400.f,
+                                        .parse = [](float value) { return std::clamp(value, 0.f, 400.f) * 0.01f; },
+                                    },
+                                });
+          }
           extra.insert(extra.begin(), {
                                           new renodx::utils::settings::Setting{
                                               .key = "OutputMode",
@@ -500,12 +620,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                                               .can_reset = false,
                                               .label = "Output",
                                               .section = "Output",
-                                              .tooltip = "SDR keeps the game's own SDR image (no HDR swapchain, no RenoDX\n"
-                                                         "tone mapping or upgrades) and only runs Starlight.\n"
+                                              .tooltip = "SDR keeps the game's own SDR image (no HDR swapchain or upgrades).\n"
+                                                         "It has its own Tone Mapper setting; Vanilla there is the game's own look.\n"
                                                          "Auto picks HDR or SDR at launch from the Windows HDR\n"
                                                          "switch of the display the game is on.\n"
                                                          "Restart the game after changing.",
-                                              .labels = {"HDR (RenoDX)", "SDR (vanilla image + Starlight)", "Auto"},
+                                              .labels = {"HDR (RenoDX)", "SDR", "Auto"},
                                               .is_global = true,
                                           },
                                           new renodx::utils::settings::Setting{
@@ -537,8 +657,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         // Load settings now: the output mode decides what gets hooked
         renodx::utils::settings::Use(DLL_PROCESS_ATTACH, &settings, &OnPresetOff);
         output_sdr_at_start = SdrSelected();
+        shader_injection.output_sdr = output_sdr_at_start ? 1.f : 0.f;
         {
-          std::string msg = std::string("RenoDX Elite: ") + (output_sdr_at_start ? "SDR output, Starlight only" : "HDR output")
+          std::string msg = std::string("RenoDX Elite: ") + (output_sdr_at_start ? "SDR output" : "HDR output")
                             + (output_mode == 2.f ? " (Auto: " + auto_reading + ")" : " (picked in settings)");
           reshade::log::message(reshade::log::level::info, msg.c_str());
         }
@@ -586,7 +707,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
   if (output_sdr_at_start) {
-    renodx::mods::shader::Use(fdw_reason, starlight_only_shaders, &shader_injection);
+    renodx::mods::shader::Use(fdw_reason, sdr_shaders, &shader_injection);
   } else {
     renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
     renodx::mods::swapchain::Use(fdw_reason, &shader_injection);

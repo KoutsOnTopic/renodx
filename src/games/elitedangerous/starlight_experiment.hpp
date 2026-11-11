@@ -467,12 +467,12 @@ inline bool HeldByOtherLight(const Remembered& e, int light) {
   return o.known && e.signature == o.signature;
 }
 
-inline const Remembered* Recall(const float dir[3], int light) {
+inline Remembered* Recall(const float dir[3], int light) {
   const float threshold = std::cos(kRestoreDegrees * 3.14159265f / 180.f);
   const bool slot_confirms = ev.slot_cos[light] >= MatchThreshold();
-  const Remembered* best = nullptr;
+  Remembered* best = nullptr;
   float best_dot = threshold;
-  for (const auto& e : visit.memory) {
+  for (auto& e : visit.memory) {
     if (HeldByOtherLight(e, light)) continue;
     const float d = e.dir[0] * dir[0] + e.dir[1] * dir[1] + e.dir[2] * dir[2];
     if (d < best_dot) continue;
@@ -570,6 +570,8 @@ inline void CopyKeepApplied(const LightState& m, LightState& v) {
   v.roll_start = keep.roll_start, v.applied_identity = keep.applied_identity;
   v.applied_frame = keep.applied_frame, v.applied_arrival = keep.applied_arrival;
   v.applied_time = keep.applied_time, v.holding = keep.holding;
+  v.applied_goal = keep.applied_goal, v.applied_goal_sat = keep.applied_goal_sat;
+  v.fading = keep.fading, v.lost_frame = keep.lost_frame, v.cut = keep.cut, v.cut_time = keep.cut_time;
 }
 
 // Every class method evaluated on its own for the default identity, without
@@ -689,9 +691,14 @@ inline void EndFrame(uint64_t arrival) {
       if (!paused) Remember(m, vd);
     } else if (m.active) {
       const bool may_recall = !paused || ev.slot_cos[i] >= threshold;  // map/tunnel lights are not stars
-      if (const Remembered* r = may_recall ? Recall(m.dir, i) : nullptr; r != nullptr) {
+      if (Remembered* r = may_recall ? Recall(m.dir, i) : nullptr; r != nullptr) {
         v.known = true, v.signature = r->signature, v.cls = r->cls, v.star_colour = r->star_colour, v.source = r->source;
         v.l_corona = r->l_corona;
+        // Still this star while the light stays on it: without this the entry
+        // aged out kRestoreFrames after the last star draw (Remember only runs
+        // for the default identity) and a star out of view lost its tint.
+        std::memcpy(r->dir, m.dir, sizeof(r->dir));
+        r->frame = frame_index;
         vd.cls = r->cls, vd.body = r->body, vd.how = "remembered direction", vd.restored = true;
       } else if (!paused && ev.slot_cos[i] >= threshold) {
         bool l_corona = false;

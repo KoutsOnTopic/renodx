@@ -35,7 +35,9 @@ void main(
   r1.x = log2(max(0, r0.y));  // clamp negatives
   r1.y = log2(max(0, r0.x));  // clamp negatives
   r0.xyz = cb2[0].xxx * r1.xyz;
-  r0.w = 1 / 2.2f;  // r0.w = 1 / cb2[0].y;
+  // HDR fixes the video gamma at 2.2; SDR keeps the game's own value so the
+  // video looks exactly as unmodded
+  r0.w = RENODX_OUTPUT_SDR != 0.f ? 1 / cb2[0].y : 1 / 2.2f;  // r0.w = 1 / cb2[0].y;
   r0.xyz = r0.www * r0.xyz;
   o0.xyz = exp2(r0.xyz);
   o0.w = 1;
